@@ -566,6 +566,43 @@ def test_preflight_link_checks(kit):
     assert r.returncode == 1 and "HEAD_IP=10.0.0.1 is not an address of eth9 on the head (it has: 10.0.0.2/24)" in r.stdout
 
 
+def test_per_rank_nccl_on_a_crossed_cable(kit):
+    """Head and worker do not share a netdev name. Unset overrides keep the single NCCL_* value."""
+    r = kit.run("start", HEAD_NCCL_SOCKET_IFNAME="eth9", WORKER_NCCL_SOCKET_IFNAME="eth8",
+                HEAD_NCCL_IB_HCA="hca0", WORKER_NCCL_IB_HCA="hca1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    a0 = (kit.state / "args.glm53-tf-r0").read_text().split("\n")
+    a1 = (kit.state / "args.glm53-tf-r1").read_text().split("\n")
+    assert "NCCL_SOCKET_IFNAME=eth9" in a0 and "NCCL_IB_HCA=hca0" in a0 and "GLOO_SOCKET_IFNAME=eth9" in a0
+    assert "NCCL_SOCKET_IFNAME=eth8" in a1 and "NCCL_IB_HCA=hca1" in a1 and "GLOO_SOCKET_IFNAME=eth8" in a1
+    assert "NCCL_SOCKET_IFNAME=eth8" not in a0 and "NCCL_IB_HCA=hca0" not in a1
+    kit.run("stop")
+    r = kit.run("preflight", WORKER_NCCL_SOCKET_IFNAME="eth7", FAKE_NETDEVS="eth9")
+    assert r.returncode == 1
+    assert "no IPv4 address on NCCL_SOCKET_IFNAME=eth7 on the worker" in r.stdout
+    assert "no IPv4 address on NCCL_SOCKET_IFNAME=eth9 on the head" not in r.stdout
+    r = kit.run("preflight", HEAD_NCCL_SOCKET_IFNAME="eth9", WORKER_NCCL_SOCKET_IFNAME="eth8",
+                FAKE_NETDEVS="eth9 eth8")
+    assert r.returncode == 0 and "preflight ok" in r.stdout, r.stdout + r.stderr
+
+
+def test_preflight_ablit_donor(kit, tmp_path):
+    missing = tmp_path / "no-donor.safetensors"
+    r = kit.run("preflight", GLM53_TF_ABLIT="1", GLM53_TF_NONEXPERT="q4mse", ABLIT_DONOR_HOST=str(missing))
+    assert r.returncode != 0
+    assert "q4mse" in r.stdout and "ablit donor missing" in r.stdout
+    donor = tmp_path / "donor.safetensors"
+    donor.write_bytes(b"not-read-here")
+    r = kit.run("preflight", GLM53_TF_ABLIT="1", GLM53_TF_NONEXPERT="bf16", ABLIT_DONOR_HOST=str(donor))
+    assert r.returncode == 0 and "ablit donor missing" not in r.stdout, r.stdout + r.stderr
+    r = kit.run("start", GLM53_TF_ABLIT="1", GLM53_TF_ABLIT_DONOR="/ablit/donor.safetensors",
+                ABLIT_DONOR_HOST=str(donor))
+    assert r.returncode == 0, r.stdout + r.stderr
+    args = (kit.state / "args.glm53-tf-r0").read_text().split("\n")
+    assert f"{donor}:/ablit/donor.safetensors:ro" in args
+    assert "GLM53_TF_ABLIT=1" in args and "GLM53_TF_ABLIT_DONOR=/ablit/donor.safetensors" in args
+
+
 def test_preflight_weights(kit, tmp_path):
     hf = tmp_path / "hf"
     snap = "/hub/models--org--Model-EXL3/snapshots/abc123"

@@ -1,0 +1,533 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/ablit.py i/src/tensorfold/families/glm5_next/cuda/ablit.py
+new file mode 100644
+index 0000000..df9db9ae191c
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/ablit.py
+@@ -0,0 +1,466 @@
++"""Load-time transplant of BF16 ``self_attn.o_proj`` (patches/0420).
++
++``GLM53_TF_ABLIT=1`` copies donor columns into layers 15–44 only, after this rank's
++slice of the checkpoint is in memory and before ``q4`` / graph capture. Layers 0–14
++stay the checkpoint (hashed, and the load fails if they change). This engine loads
++the MTP block as ``layers.{num_hidden_layers}.self_attn.o_proj``; that tensor is
++left stock and the log says ``mtp=False``. A name under ``mtp_block`` is left stock
++too. There is no projection fallback: a missing donor refuses the load.
++
++``GLM53_TF_NONEXPERT`` must stay ``bf16``. ``q4`` / ``q4mse`` would quantize the
++tensors just copied.
++
++The donor is the full unsharded tensor. ``o_proj`` is a column split of the last
++axis (``split.rule``); rank ``r`` of ``world`` takes columns
++``[r*half:(r+1)*half]``.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++import os
++import re
++import struct
++from pathlib import Path
++
++DEFAULT_LAYERS = "15-44"
++_O_PROJ = re.compile(r"^layers\.(\d+)\.self_attn\.o_proj\.weight$")
++_MTP_O_PROJ = re.compile(r"^layers\.(\d+)\.mtp_block\.self_attn\.o_proj\.weight$")
++_ON = {"1", "on", "yes", "true"}
++
++
++class AblitError(RuntimeError):
++    """ABLIT was requested and the transplant cannot be applied as specified."""
++
++
++def enabled() -> bool:
++    return os.environ.get("GLM53_TF_ABLIT", "0").strip().lower() in _ON
++
++
++def donor_path() -> str:
++    return os.environ.get("GLM53_TF_ABLIT_DONOR", "").strip()
++
++
++def layer_spec() -> str:
++    return (os.environ.get("GLM53_TF_ABLIT_LAYERS") or DEFAULT_LAYERS).strip()
++
++
++def nonexpert_mode() -> str:
++    return os.environ.get("GLM53_TF_NONEXPERT", "bf16").strip().lower()
++
++
++def parse_layers(spec: str) -> list[int]:
++    layers: set[int] = set()
++    for part in spec.split(","):
++        part = part.strip()
++        if not part:
++            continue
++        if "-" in part:
++            lo_s, hi_s = part.split("-", 1)
++            try:
++                lo, hi = int(lo_s), int(hi_s)
++            except ValueError as exc:
++                raise AblitError(f"GLM53_TF_ABLIT_LAYERS: bad range {part!r}") from exc
++            if hi < lo:
++                raise AblitError(f"GLM53_TF_ABLIT_LAYERS: inverted range {part!r}")
++            layers.update(range(lo, hi + 1))
++        else:
++            try:
++                layers.add(int(part))
++            except ValueError as exc:
++                raise AblitError(f"GLM53_TF_ABLIT_LAYERS: bad index {part!r}") from exc
++    if not layers:
++        raise AblitError("GLM53_TF_ABLIT_LAYERS resolved to an empty set")
++    return sorted(layers)
++
++
++def donor_key(layer: int) -> str:
++    return f"model.language_model.layers.{layer}.self_attn.o_proj.weight"
++
++
++def classify(name: str, n_layers: int, edit: set[int]) -> tuple[str, int | None]:
++    """``edit`` | ``guard`` | ``mtp`` | ``other``, and the layer index when there is one.
++
++    Layer ``n_layers`` is the MTP block in this engine (``weights.load_checkpoint``
++    calls ``layer(cfg.layers)``), even though the tensor name is ``self_attn.o_proj``
++    and not ``mtp_block``.
++    """
++
++    mtp = _MTP_O_PROJ.match(name)
++    if mtp:
++        return "mtp", int(mtp.group(1))
++    main = _O_PROJ.match(name)
++    if not main:
++        return "other", None
++    layer = int(main.group(1))
++    if layer >= n_layers:
++        return "mtp", layer
++    if layer in edit:
++        return "edit", layer
++    return "guard", layer
++
++
++def read_header(path: str | Path) -> tuple[dict, int]:
++    with open(path, "rb") as f:
++        n = struct.unpack("<Q", f.read(8))[0]
++        header = json.loads(f.read(n))
++    return header, 8 + n
++
++
++def donor_layers_from_header(header: dict) -> dict[int, dict]:
++    found: dict[int, dict] = {}
++    for key, info in header.items():
++        if key == "__metadata__":
++            continue
++        prefix = "model.language_model."
++        name = key[len(prefix):] if key.startswith(prefix) else key
++        if _MTP_O_PROJ.match(name):
++            raise AblitError(f"donor tensor {key} is an MTP o_proj; this patch does not apply it")
++        main = _O_PROJ.match(name)
++        if not main:
++            raise AblitError(f"donor tensor {key} is not a self_attn.o_proj")
++        found[int(main.group(1))] = info
++    return found
++
++
++def column_half(raw: bytes, shape: list[int], itemsize: int, rank: int, world: int = 2) -> tuple[bytes, list[int]]:
++    """Full BF16 (or any packed) matrix -> this rank's last-axis half. Same rule as ``split.split_bytes`` kind ``col``."""
++
++    if world < 1 or not 0 <= rank < world:
++        raise AblitError(f"rank {rank} is outside world {world}")
++    if len(shape) != 2 or itemsize <= 0:
++        raise AblitError(f"column split needs a 2-D tensor, got {shape}")
++    rows, cols = int(shape[0]), int(shape[1])
++    if cols % world:
++        raise AblitError(f"column split needs a last dim divisible by {world}, got {shape}")
++    expect = rows * cols * itemsize
++    if len(raw) != expect:
++        raise AblitError(f"tensor has {len(raw)} bytes, expected {expect} for shape {shape}")
++    half = cols // world
++    row_bytes = cols * itemsize
++    half_bytes = half * itemsize
++    start = rank * half_bytes
++    out = bytearray(rows * half_bytes)
++    for r in range(rows):
++        src = r * row_bytes + start
++        dst = r * half_bytes
++        out[dst:dst + half_bytes] = raw[src:src + half_bytes]
++    return bytes(out), [rows, half]
++
++
++def _bf16_f32(two: bytes) -> float:
++    return struct.unpack("<f", struct.pack("<I", int.from_bytes(two, "little") << 16))[0]
++
++
++def rel_l2_bf16(stock: bytes, donor: bytes) -> float:
++    """Relative L2 of two BF16 blobs. For tests and other small buffers; the load path uses torch."""
++
++    if len(stock) != len(donor) or len(stock) % 2:
++        raise AblitError(f"rel_l2 length mismatch ({len(stock)} vs {len(donor)})")
++    num = 0.0
++    den = 0.0
++    for i in range(0, len(stock), 2):
++        x = _bf16_f32(stock[i:i + 2])
++        y = _bf16_f32(donor[i:i + 2])
++        d = y - x
++        num += d * d
++        den += x * x
++    return math.sqrt(num) / max(math.sqrt(den), 1e-9)
++
++
++def validate_edit(edit: list[int], n_layers: int) -> None:
++    if any(i < 0 or i >= n_layers for i in edit):
++        raise AblitError(
++            f"GLM53_TF_ABLIT_LAYERS includes an index outside 0..{n_layers - 1}. "
++            f"Layer {n_layers} is the MTP block in this engine and stays stock "
++            "(donor layer 45 is not applied; log mtp=False). Use 15-44."
++        )
++
++
++def _refuse_quant() -> None:
++    mode = nonexpert_mode()
++    if mode != "bf16":
++        raise AblitError(
++            f"GLM53_TF_ABLIT=1 refuses GLM53_TF_NONEXPERT={mode!r}: q4/q4mse would quantize the transplanted o_proj"
++        )
++
++
++def _require_donor_file() -> str:
++    path = donor_path()
++    if not path or not Path(path).is_file():
++        shown = path or "(GLM53_TF_ABLIT_DONOR is unset)"
++        raise AblitError(f"GLM53_TF_ABLIT=1 but the donor is missing: {shown}")
++    return path
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        for chunk in iter(lambda: f.read(1024 * 1024), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def cache_extra() -> dict:
++    """Fields mixed into the prepared-folder key. Off and on must not share a folder."""
++
++    if not enabled():
++        return {"on": False}
++    _refuse_quant()
++    path = _require_donor_file()
++    return {
++        "on": True,
++        "method": "transplant",
++        "layers": layer_spec(),
++        "donor": path,
++        "donor_sha256": sha256_file(path),
++        "nonexpert": nonexpert_mode(),
++    }
++
++
++def finalize(hits: list[dict], *, edit: set[int], n_layers: int, donor_has_45: bool) -> dict:
++    """Accept a load only when  the requested layers were copied, anchors did not move, and MTP was not edited."""
++
++    edited: dict[int, float] = {}
++    guarded: set[int] = set()
++    for hit in hits:
++        kind = hit["kind"]
++        if kind == "other":
++            continue
++        if kind == "edit":
++            post = hit.get("post_rel")
++            layer = int(hit["layer"])
++            if post is None or not math.isfinite(post) or post > 1e-3:
++                raise AblitError(f"layer {layer} post-copy rel_l2={post} (want ~0)")
++            edited[layer] = float(post)
++        elif kind == "guard":
++            if hit.get("changed"):
++                raise AblitError(f"layer {hit['layer']} o_proj changed during transplant (layers 0-14 stay stock)")
++            guarded.add(int(hit["layer"]))
++        elif kind == "mtp":
++            if hit.get("changed"):
++                raise AblitError(f"MTP o_proj {hit.get('name')} was edited; this patch leaves it stock")
++        else:
++            raise AblitError(f"unknown ablit hit {kind!r}")
++    if set(edited) != set(edit):
++        missing = sorted(set(edit) - set(edited))
++        extra = sorted(set(edited) - set(edit))
++        raise AblitError(f"transplant edited {sorted(edited)}; missing {missing} extra {extra}")
++    expected = set(range(n_layers)) - set(edit)
++    if guarded != expected:
++        raise AblitError(
++            f"guard layers mismatch: missing {sorted(expected - guarded)} extra {sorted(guarded - expected)}"
++        )
++    mean = sum(edited.values()) / len(edited)
++    return {
++        "edited": sorted(edited),
++        "mtp": False,
++        "mean_rel_l2": mean,
++        "guarded": sorted(guarded),
++        "donor_layer_45": donor_has_45,
++    }
++
++
++def format_log(report: dict, *, spec: str, rank: int, pre_mean: float) -> str:
++    side = "present_not_applied" if report["donor_layer_45"] else "absent"
++    return (
++        f"[ablit] ON method=transplant layers={spec} edited={report['edited']} "
++        f"mtp=False mean rel_l2={report['mean_rel_l2']:.4f} pre_rel_l2={pre_mean:.4f} "
++        f"rank={rank} guarded={report['guarded']} donor_layer_45={side}"
++    )
++
++
++def apply_store(
++    store: dict[str, bytes],
++    shapes: dict[str, list[int]],
++    *,
++    n_layers: int,
++    edit: list[int],
++    donor: dict[int, tuple[bytes, list[int]]],
++    rank: int,
++    world: int = 2,
++) -> dict:
++    """Byte-level transplant used by the CPU test. ``store`` values are this rank's BF16 slice.
++
++    ``donor`` values are the full unsharded tensors. Guard and MTP entries are not written.
++    """
++
++    edit_set = set(edit)
++    hits: list[dict] = []
++    pre: list[float] = []
++    originals = dict(store)
++    for name in list(store):
++        kind, layer = classify(name, n_layers, edit_set)
++        if kind == "other":
++            hits.append({"kind": "other", "name": name})
++            continue
++        original = originals[name]
++        if kind in ("guard", "mtp"):
++            hits.append({"kind": kind, "name": name, "layer": layer, "changed": False})
++            continue
++        if layer not in donor:
++            raise AblitError(f"no donor tensor for layer {layer}")
++        full, full_shape = donor[layer]
++        half, half_shape = column_half(full, full_shape, 2, rank, world)
++        if half_shape != list(shapes[name]) or len(half) != len(original):
++            raise AblitError(
++                f"{name}: rank slice {half_shape} ({len(half)} bytes) != checkpoint {shapes[name]} ({len(original)} bytes)"
++            )
++        pre.append(rel_l2_bf16(original, half))
++        store[name] = half
++        post = rel_l2_bf16(store[name], half)
++        hits.append({"kind": "edit", "name": name, "layer": layer, "changed": store[name] != original, "post_rel": post})
++    for hit in hits:
++        if hit["kind"] in ("guard", "mtp") and store[hit["name"]] != originals[hit["name"]]:
++            hit["changed"] = True
++    report = finalize(hits, edit=edit_set, n_layers=n_layers, donor_has_45=45 in donor)
++    report["pre_mean"] = sum(pre) / len(pre) if pre else 0.0
++    return report
++
++
++class _Session:
++    def __init__(self, rank: int, world: int, n_layers: int, spec: str, edit: list[int], path: str, header: dict, base: int):
++        self.rank = rank
++        self.world = world
++        self.n_layers = n_layers
++        self.spec = spec
++        self.edit = set(edit)
++        self.path = path
++        self.header = header
++        self.data_base = base
++        self.index = donor_layers_from_header(header)
++        self.hits: list[dict] = []
++        self.pre: list[float] = []
++        self._payload: dict[int, tuple[bytes, list[int]]] = {}
++        self._guard_sha: dict[str, str] = {}
++
++    def payload(self, layer: int) -> tuple[bytes, list[int]]:
++        if layer not in self._payload:
++            info = self.index[layer]
++            if info.get("dtype") != "BF16" or len(info.get("shape") or []) != 2:
++                raise AblitError(f"donor layer {layer} is not a BF16 matrix ({info})")
++            key = donor_key(layer)
++            a, b = info["data_offsets"]
++            with open(self.path, "rb") as f:
++                f.seek(self.data_base + a)
++                raw = f.read(b - a)
++            if len(raw) != b - a:
++                raise AblitError(f"donor layer {layer}: short read {len(raw)} != {b - a}")
++            self._payload[layer] = (raw, [int(x) for x in info["shape"]])
++        return self._payload[layer]
++
++
++_session: _Session | None = None
++
++
++def begin(*, rank: int, world: int, n_layers: int) -> None:
++    """Call once at the start of ``load_checkpoint``. Raises before any weight is built."""
++
++    global _session
++    _session = None
++    if not enabled():
++        return
++    _refuse_quant()
++    spec = layer_spec()
++    edit = parse_layers(spec)
++    validate_edit(edit, n_layers)
++    path = _require_donor_file()
++    header, base = read_header(path)
++    index = donor_layers_from_header(header)
++    missing = [i for i in edit if i not in index]
++    if missing:
++        raise AblitError(f"donor {path} has no o_proj for layers {missing}")
++    for i in edit:
++        info = index[i]
++        shape = info.get("shape") or []
++        if info.get("dtype") != "BF16" or len(shape) != 2 or int(shape[1]) % world:
++            raise AblitError(f"donor layer {i} is not a BF16 matrix whose last dim splits across {world} ranks ({info})")
++    _session = _Session(rank, world, n_layers, spec, edit, path, header, base)
++
++
++def _torch_bytes(tensor) -> bytes:
++    import torch
++
++    if tensor.dtype != torch.bfloat16 or tensor.dim() != 2:
++        raise AblitError(f"o_proj transplant expects a BF16 matrix, got dtype={tensor.dtype} shape={tuple(tensor.shape)}")
++    flat = tensor.detach().contiguous().view(torch.uint8).cpu()
++    return bytes(flat.numpy().tobytes())
++
++
++def _sha(raw: bytes) -> str:
++    return hashlib.sha256(raw).hexdigest()
++
++
++def maybe_transplant(name: str, tensor):
++    """Replace an edit-layer ``o_proj`` in place. Any other tensor is returned unchanged.
++
++    A second call for the same name (the vLLM loader did this) copies again. The
++    post-copy error is what ``finish`` logs; the pre-copy distance is recorded once.
++    """
++
++    if _session is None:
++        return tensor
++    kind, layer = classify(name, _session.n_layers, _session.edit)
++    if kind == "other":
++        return tensor
++    raw = _torch_bytes(tensor)
++    if kind in ("guard", "mtp"):
++        digest = _sha(raw)
++        prev = _session._guard_sha.get(name)
++        if prev is None:
++            _session._guard_sha[name] = digest
++            _session.hits.append({"kind": kind, "name": name, "layer": layer, "changed": False})
++        elif prev != digest:
++            for hit in _session.hits:
++                if hit.get("name") == name and hit["kind"] == kind:
++                    hit["changed"] = True
++        return tensor
++    assert layer is not None
++    full, full_shape = _session.payload(layer)
++    half, half_shape = column_half(full, full_shape, 2, _session.rank, _session.world)
++    if half_shape != [int(tensor.shape[0]), int(tensor.shape[1])] or len(half) != len(raw):
++        raise AblitError(
++            f"{name}: donor rank slice {half_shape} != checkpoint {tuple(tensor.shape)}"
++        )
++    import torch
++
++    buf = bytearray(half)
++    shard = torch.frombuffer(buf, dtype=torch.bfloat16).reshape(half_shape).clone()
++    first = not any(h.get("name") == name and h["kind"] == "edit" for h in _session.hits)
++    if first:
++        _session.pre.append(_rel_torch(tensor, shard))
++    if not tensor.is_contiguous():
++        raise AblitError(f"{name} is not contiguous")
++    tensor.copy_(shard)
++    post = rel_l2_bf16(_torch_bytes(tensor), half)
++    if first:
++        _session.hits.append({"kind": "edit", "name": name, "layer": layer, "changed": True, "post_rel": post})
++    else:
++        for hit in _session.hits:
++            if hit.get("name") == name and hit["kind"] == "edit":
++                hit["post_rel"] = post
++    return tensor
++
++
++def _rel_torch(stock, shard) -> float:
++    s = stock.detach().float()
++    d = shard.detach().float()
++    return float((d - s).norm() / s.norm().clamp_min(1e-9))
++
++
++def finish() -> dict | None:
++    """Log the transplant. The line that counts is this one: ``mtp=False`` and ``mean rel_l2`` near 0."""
++
++    if _session is None:
++        return None
++    report = finalize(
++        _session.hits,
++        edit=_session.edit,
++        n_layers=_session.n_layers,
++        donor_has_45=45 in _session.index,
++    )
++    pre_mean = sum(_session.pre) / len(_session.pre) if _session.pre else 0.0
++    print(format_log(report, spec=_session.spec, rank=_session.rank, pre_mean=pre_mean), flush=True)
++    return report
+diff --git c/src/tensorfold/families/glm5_next/cuda/fastboot.py i/src/tensorfold/families/glm5_next/cuda/fastboot.py
+--- c/src/tensorfold/families/glm5_next/cuda/fastboot.py
++++ i/src/tensorfold/families/glm5_next/cuda/fastboot.py
+@@ -139,7 +139,7 @@
+ 
+ 
+ PKG = __name__.rsplit(".", 1)[0]          # tensorfold.families.glm5_next.cuda
+-WEIGHT_CODE = [f"{PKG}.weights", f"{PKG}.split", f"{PKG}.fastboot:FORMAT",
++WEIGHT_CODE = [f"{PKG}.weights", f"{PKG}.ablit", f"{PKG}.split", f"{PKG}.fastboot:FORMAT",
+                f"{PKG}.qmm:Q4", f"{PKG}.qmm:B16", f"{PKG}.qmm:Experts", f"{PKG}.qmm:tile_words", f"{PKG}.qmm:as_i32",
+                f"{PKG}.qmm:make_q4", f"{PKG}.qmm:stack_q4", f"{PKG}.qmm:make_b16", f"{PKG}.qmm:stack_b16",
+                f"{PKG}.qmm:quantize4", f"{PKG}.qmm:_clip_search", f"{PKG}.qmm:make_experts",
+@@ -171,11 +171,14 @@
+ def weights_key(model_dir: str | Path, rank: int, *, device: str = "cuda", extra: dict | None = None) -> dict:
+     import torch
+ 
++    from . import ablit
+     from . import weights
+ 
+     key = {"format": FORMAT, "what": "weights", "model": model_rev(model_dir), "files": files_ident(model_dir),
+            "rank": int(rank), "world": 2, "nonexpert": weights.NONEXPERT, "torch": torch.__version__,
+            "device": str(torch.device(device).type), "code": source_digest(WEIGHT_CODE)}
++    # patches/0420: a prepared folder built without the transplant must not be reused when ablit is on.
++    key["ablit"] = ablit.cache_extra()
+     key.update(extra or {})
+     return key
+ 
+diff --git c/src/tensorfold/families/glm5_next/cuda/weights.py i/src/tensorfold/families/glm5_next/cuda/weights.py
+--- c/src/tensorfold/families/glm5_next/cuda/weights.py
++++ i/src/tensorfold/families/glm5_next/cuda/weights.py
+@@ -293,10 +293,13 @@
+ def load_checkpoint(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
+     """``load`` from the checkpoint itself (patches/0140: the path every start took before prepared folders)."""
+ 
++    from . import ablit
+     from .split import RankReader
+ 
+     world = 2
+     cfg = Config.read(model_dir)
++    # patches/0420: refuse a missing donor / q4mse before the checkpoint is mapped.
++    ablit.begin(rank=rank, world=world, n_layers=cfg.layers)
+     if cfg.quant not in ("mlx", "exl3"):
+         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
+     exl3 = cfg.quant == "exl3"
+@@ -309,6 +312,9 @@
+         x = rd.get(PREFIX + name)
+         if dtype is not None:
+             x = x.to(dtype)
++        # Transplant while the tensor is still on the CPU. q4() quantizes whatever this returns,
++        # so ablit refuses GLM53_TF_NONEXPERT other than bf16 before we get here.
++        x = ablit.maybe_transplant(name, x)
+         return x.to(dev)
+ 
+     def trip(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+@@ -433,5 +439,6 @@
+                     t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))
+     w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head)
+     w.meta.update(layers=which)
++    ablit.finish()
+     torch.cuda.empty_cache()
+     return w

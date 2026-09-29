@@ -31,7 +31,7 @@ fi
 export CONFIG
 # A non-empty caller export wins over the same key in the config file:
 #   CONTEXT=32768 GLM53_TF_NONEXPERT=q4mse scripts/serve.sh start
-caller_env=$(env | grep -E '^(HEAD_PREPARED|WORKER_PREPARED|HEAD_SESSIONS|WORKER_SESSIONS|CONTEXT|MTP_DRAFTS|NO_DRAFTS|IMAGE|PORT|HOST|DRAFTER|MODEL_PATH|EXTRA_ARGS|SERVED_NAME|MAX_TOKENS|CPUSET|HEAD_CPUSET|WORKER_CPUSET|CANARY[A-Z_]*|MEM_GATE_[A-Z_]+|START_ATTEMPTS|READY_TIMEOUT|LOG_MAX_[A-Z]+|WATCH_[A-Z_]+|GPUWATCH_[A-Z_]+|WARMUP_LENGTHS|PREFLIGHT|NCCL_PASSTHROUGH|GLM53_TF_[A-Z0-9_]+)=.' || true)
+caller_env=$(env | grep -E '^(HEAD_PREPARED|WORKER_PREPARED|HEAD_SESSIONS|WORKER_SESSIONS|CONTEXT|MTP_DRAFTS|NO_DRAFTS|IMAGE|PORT|HOST|DRAFTER|MODEL_PATH|EXTRA_ARGS|SERVED_NAME|MAX_TOKENS|CPUSET|HEAD_CPUSET|WORKER_CPUSET|CANARY[A-Z_]*|MEM_GATE_[A-Z_]+|START_ATTEMPTS|READY_TIMEOUT|LOG_MAX_[A-Z]+|WATCH_[A-Z_]+|GPUWATCH_[A-Z_]+|WARMUP_LENGTHS|PREFLIGHT|NCCL_PASSTHROUGH|HEAD_NCCL_SOCKET_IFNAME|WORKER_NCCL_SOCKET_IFNAME|HEAD_NCCL_IB_HCA|WORKER_NCCL_IB_HCA|ABLIT_DONOR_HOST|GLM53_TF_[A-Z0-9_]+)=.' || true)
 # shellcheck disable=SC1090
 set -a; source "$CONFIG"; set +a
 while IFS= read -r kv; do [[ -n "$kv" ]] && export "${kv?}"; done <<< "$caller_env"
@@ -68,6 +68,18 @@ NCCL_PASSTHROUGH="${NCCL_PASSTHROUGH:-0}"     # 1: every other NCCL_* variable s
 CPUSET="${CPUSET:-}"
 HEAD_CPUSET="${HEAD_CPUSET:-$CPUSET}"
 WORKER_CPUSET="${WORKER_CPUSET:-$CPUSET}"
+# Crossed CX7: the two ranks are not on the same netdev name. HEAD_/WORKER_ override the single
+# NCCL_SOCKET_IFNAME / NCCL_IB_HCA, which remain the default for both when the overrides are unset.
+HEAD_NCCL_SOCKET_IFNAME="${HEAD_NCCL_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME:-}}"
+WORKER_NCCL_SOCKET_IFNAME="${WORKER_NCCL_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME:-}}"
+HEAD_NCCL_IB_HCA="${HEAD_NCCL_IB_HCA:-${NCCL_IB_HCA:-}}"
+WORKER_NCCL_IB_HCA="${WORKER_NCCL_IB_HCA:-${NCCL_IB_HCA:-}}"
+nccl_if() { # $1 = head | worker
+    if [[ "$1" == head ]]; then echo "$HEAD_NCCL_SOCKET_IFNAME"; else echo "$WORKER_NCCL_SOCKET_IFNAME"; fi
+}
+nccl_hca() {
+    if [[ "$1" == head ]]; then echo "$HEAD_NCCL_IB_HCA"; else echo "$WORKER_NCCL_IB_HCA"; fi
+}
 # preflight's GPU state check (scripts/gpuwatch.py check, docs/OPS-GPUWATCH.md): off | on (a degraded node -- clock or
 # power clamp, a step-time regression past the transient window -- is a preflight problem; warnings are logged) |
 # strict (a warning is a problem too: a recent slow state, an idle clock asymmetry; use for benchmark windows)
@@ -113,12 +125,17 @@ context_check() {
 }
 
 run_args() { # $1 = rank, $2 = host HF cache dir
-    local rank=$1 hf=$2 prep sess
+    local rank=$1 hf=$2 prep sess ifn hca ablit_vol=""
     # patches/0140: this node's prepared rank folders (scripts/prepare.sh) at /prepared; the image id and the launch
     # time key the calibration cache and start the [boot] timeline
     if [[ "$rank" == 0 ]]; then prep="$HEAD_PREPARED"; else prep="$WORKER_PREPARED"; fi
     if [[ "$rank" == 0 ]]; then sess="$HEAD_SESSIONS"; else sess="$WORKER_SESSIONS"; fi   # patches/0250
     local cpuset="$HEAD_CPUSET"; [[ "$rank" == 0 ]] || cpuset="$WORKER_CPUSET"             # patches/0370
+    if [[ "$rank" == 0 ]]; then ifn=$(nccl_if head); hca=$(nccl_hca head); else ifn=$(nccl_if worker); hca=$(nccl_hca worker); fi
+    # patches/0420: the donor is a host file, not part of the HF cache. Same path on both nodes.
+    if [[ "${GLM53_TF_ABLIT:-0}" =~ ^(1|on|yes|true)$ ]] && [[ -n "${ABLIT_DONOR_HOST:-}" ]]; then
+        ablit_vol="-v ${ABLIT_DONOR_HOST}:/ablit/donor.safetensors:ro"
+    fi
     echo --name "$NAME-r$rank" -d --gpus all --ipc=host --network host \
         ${cpuset:+--cpuset-cpus "$cpuset"} \
         -v "$prep:/prepared" -e GLM53_TF_PREPARED=/prepared -e GLM53_TF_PREPARED_WRITE="${GLM53_TF_PREPARED_WRITE:-1}" \
@@ -138,8 +155,9 @@ run_args() { # $1 = rank, $2 = host HF cache dir
         -e GLM53_TF_EXPERT_LOOP_CFG="${GLM53_TF_EXPERT_LOOP_CFG:-4,2}" \
         $(env | grep -E '^GLM53_TF_[A-Z0-9_]+=' | sed 's/^/-e /' | tr '\n' ' ') \
         $([[ "$NCCL_PASSTHROUGH" == 1 ]] && env | grep -E '^NCCL_[A-Z0-9_]+=' | grep -vE '^NCCL_(SOCKET_IFNAME|IB_HCA|PASSTHROUGH)=' | sed 's/^/-e /' | tr '\n' ' ') \
-        -e NCCL_SOCKET_IFNAME="$NCCL_SOCKET_IFNAME" -e NCCL_IB_HCA="$NCCL_IB_HCA" \
-        -e GLOO_SOCKET_IFNAME="$NCCL_SOCKET_IFNAME" "$IMAGE"
+        ${ablit_vol} \
+        -e NCCL_SOCKET_IFNAME="$ifn" -e NCCL_IB_HCA="$hca" \
+        -e GLOO_SOCKET_IFNAME="$ifn" "$IMAGE"
 }
 
 gpu_busy() { # a foreign CUDA process on either node means the other stack is still up
@@ -190,8 +208,10 @@ on_node() { # $1 = head | worker, then a command line (one string): run it on th
     if [[ "$n" == head ]]; then bash -c "$*"; else wssh "$*"; fi
 }
 
-link_addrs() { # $1 = head | worker: the IPv4 addresses (a.b.c.d/nn) on NCCL_SOCKET_IFNAME, space-separated
-    on_node "$1" "ip -o -4 addr show dev '$NCCL_SOCKET_IFNAME'" 2>/dev/null | awk '{printf "%s ", $4}' || true
+link_addrs() { # $1 = head | worker: the IPv4 addresses (a.b.c.d/nn) on that rank's NCCL netdev, space-separated
+    local ifn
+    ifn=$(nccl_if "$1")
+    on_node "$1" "ip -o -4 addr show dev '$ifn'" 2>/dev/null | awk '{printf "%s ", $4}' || true
 }
 
 weights_missing() { # $1 = head | worker, $2 = that node's HF cache, $3 = container path, $4 = file to look for:
@@ -220,16 +240,19 @@ preflight() { # read-only checks (AGENTS.md lists them); non-zero on a problem a
     wssh docker image inspect "$IMAGE" >/dev/null 2>&1 || { log "preflight: no image $IMAGE on the worker (scripts/serve.sh build ships it)"; bad=1; }
     [[ -n "$(ls -A vendor/TensorFold 2>/dev/null)" ]] \
         || log "preflight: warning: vendor/TensorFold is empty: git submodule update --init (serve.sh build needs it)"
-    # the CX7 link: NCCL_SOCKET_IFNAME carries an address on both nodes, HEAD_IP is the head's
+    # the CX7 link: each rank's netdev carries an address, and HEAD_IP is the head's. The names may differ
+    # (a crossed cable): HEAD_NCCL_SOCKET_IFNAME / WORKER_NCCL_SOCKET_IFNAME, else NCCL_SOCKET_IFNAME on both.
     if command -v ip >/dev/null 2>&1; then
         for node in head worker; do
             a=$(link_addrs "$node")
+            ifn=$(nccl_if "$node")
+            hca=$(nccl_hca "$node")
             if [[ -z "$a" ]]; then
-                log "preflight: no IPv4 address on NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME on the $node: set it to the CX7" \
-                    "netdev that carries the link (ibdev2netdev: '$NCCL_IB_HCA port 1 ==> <netdev> (Up)'; ip -br addr)"
+                log "preflight: no IPv4 address on NCCL_SOCKET_IFNAME=$ifn on the $node: set it to the CX7" \
+                    "netdev that carries the link (ibdev2netdev: '$hca port 1 ==> <netdev> (Up)'; ip -br addr)"
                 bad=1
             elif [[ "$node" == head && "$HEAD_IP" =~ ^[0-9]+(\.[0-9]+){3}$ && " $a" != *" $HEAD_IP/"* ]]; then
-                log "preflight: HEAD_IP=$HEAD_IP is not an address of $NCCL_SOCKET_IFNAME on the head (it has: ${a% })"
+                log "preflight: HEAD_IP=$HEAD_IP is not an address of $ifn on the head (it has: ${a% })"
                 bad=1
             fi
         done
@@ -237,13 +260,17 @@ preflight() { # read-only checks (AGENTS.md lists them); non-zero on a problem a
         log "preflight: warning: no 'ip' command here; cannot check NCCL_SOCKET_IFNAME / HEAD_IP"
     fi
     # the RDMA port of the link must be up on both nodes (a down port shows as an NCCL timeout minutes into the load)
-    st=$(cat "/sys/class/infiniband/$NCCL_IB_HCA/ports/1/state" 2>/dev/null || echo "")
-    wst=$(wssh cat "/sys/class/infiniband/$NCCL_IB_HCA/ports/1/state" 2>/dev/null || echo "")
-    for pair in "head:$st" "worker:$wst"; do
-        case "${pair#*:}" in
+    st=$(cat "/sys/class/infiniband/$(nccl_hca head)/ports/1/state" 2>/dev/null || echo "")
+    wst=$(wssh cat "/sys/class/infiniband/$(nccl_hca worker)/ports/1/state" 2>/dev/null || echo "")
+    for pair in "head:$(nccl_hca head):$st" "worker:$(nccl_hca worker):$wst"; do
+        node="${pair%%:*}"
+        rest="${pair#*:}"
+        hca="${rest%%:*}"
+        state="${rest#*:}"
+        case "$state" in
             *ACTIVE*) ;;
-            "") log "preflight: warning: cannot read $NCCL_IB_HCA port state on the ${pair%%:*}" ;;
-            *) log "preflight: $NCCL_IB_HCA port 1 on the ${pair%%:*} is '${pair#*:}', not ACTIVE"; bad=1 ;;
+            "") log "preflight: warning: cannot read $hca port state on the $node" ;;
+            *) log "preflight: $hca port 1 on the $node is '${state}', not ACTIVE"; bad=1 ;;
         esac
     done
     # vm.min_free_kbytes is taken from the GPU's share of unified memory; a mismatch gives the ranks different room
@@ -276,6 +303,24 @@ preflight() { # read-only checks (AGENTS.md lists them); non-zero on a problem a
         wssh sudo -n true 2>/dev/null || log "preflight: warning: no passwordless sudo -n on the worker: the memory gate cannot drop page caches"
     fi
     if gpu_busy; then log "preflight: a CUDA process is running on a node (nvidia-smi): stop the other stack (vLLM, ...) first"; bad=1; fi
+    # patches/0420: transplant refuses a missing donor and refuses q4/q4mse (that would quantize the copy)
+    case "${GLM53_TF_ABLIT:-0}" in
+        1|on|yes|true)
+            case "${GLM53_TF_NONEXPERT:-bf16}" in
+                bf16) ;;
+                *) log "preflight: GLM53_TF_ABLIT=1 refuses GLM53_TF_NONEXPERT=${GLM53_TF_NONEXPERT:-} (q4/q4mse would quantize the transplanted o_proj)"; bad=1 ;;
+            esac
+            if [[ -z "${ABLIT_DONOR_HOST:-}" ]]; then
+                log "preflight: ABLIT_DONOR_HOST is not set"
+                bad=1
+            else
+                for node in head worker; do
+                    on_node "$node" "test -f '$ABLIT_DONOR_HOST'" 2>/dev/null \
+                        || { log "preflight: ablit donor missing on the $node ($ABLIT_DONOR_HOST)"; bad=1; }
+                done
+            fi
+            ;;
+    esac
     # a RoCE failure at run time leaves a marker in the cache volume; the next start then serves on NCCL
     mark="${GLM53_TF_ROCE_MARK:-}"
     if [[ "${GLM53_TF_COMM_BACKEND:-}" == roce && "$mark" == /cache/* ]]; then
