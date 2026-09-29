@@ -590,8 +590,6 @@ Before publishing a fork: `scripts/check-public.sh` scans the tree for private I
 - [neko-legends](https://huggingface.co/neko-legends) (abliterated EXL3 weights, under Local Inference Lab's
   ShapleyMCG license) and [orcarouter](https://huggingface.co/orcarouter/GLM-5.3-Flash-Uncensored-FP8) (the
   uncensored FP8 source).
-- [brandonmusic](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw): the TR3 checkpoint itself. Other kits
-  publish numbers on it; this serve loads the Mia mirror of the same snapshot.
 - [turboderp / ExLlamaV3](https://github.com/turboderp-org/exllamav3): the EXL3 format.
 - [incoai](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2): the DFlash2 drafter.
 - [Z.ai](https://huggingface.co/zai-org/GLM-5.3-Flash): GLM-5.3-Flash.
