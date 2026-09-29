@@ -1,9 +1,15 @@
 # Results
 
+> **This file is the imported Jayleaton log, not the fork's current serve.** W10 and the sections below measure
+> `neko-legends/GLM-5.3-Flash-Uncensored-EXL3` @ `07135ec0` with `q4mse`, RoCE and a 4-request pool. The running
+> profile is Mia TR3 weights, a Dealign `o_proj` transplant (layers 15–44), latent FP8, and 524,288 context:
+> [`MIA-512K.md`](MIA-512K.md), [`../config/mia-512k.env.example`](../config/mia-512k.env.example), receipts in
+> [`../results/mia-512k/`](../results/mia-512k/README.md). Do not quote W10 as that boot.
+
 > **Work in progress.** Measured on one pair of DGX Sparks, 2026-09-27 to 2026-09-29, with the **abliterated** checkpoint
-> below. The sections are in the order the work happened; the newest ones are the current state: **W10** (the end of
-> this file) for the production config (`config/prod.env.example`: 4 requests sharing a 1M-token KV pool), "Stacked run
-> and production config" for the older single-stream config. The public repo carries the benchmark JSON and the
+> below. The sections are in the order the work happened. **W10** (the end of this file) is the newest *imported*
+> config (`config/prod.env.example`: 4 requests sharing a 1M-token KV pool), and "Stacked run and production config"
+> is the older single-stream config on those same weights. The public repo carries the benchmark JSON and the
 > window scripts of the runs in `results/` (E*, F*, L*, M*, P*, Q*, A1, B1, B2, S1, X1, Y1, Z1, Z2, W1-W10, roofline,
 > sim0340, sim0380); logs (`*.log`, `*.out`, `*.err`), nsys traces, test output of the early runs and some runs (B3,
 > K0, K1, P1, T*) are summarized here only. Hosts in the JSON were normalized to `127.0.0.1` / `<worker-ssh>`, node

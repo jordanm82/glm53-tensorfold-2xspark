@@ -5,6 +5,16 @@ This project's own code, scripts, benchmarks and documentation are licensed unde
 Version 2.0 (see LICENSE). If you redistribute this project or a modified version of it, keep this NOTICE
 file and the copyright line above, and state what you changed (Apache-2.0, section 4).
 
+Current serve (2026-09-29), weights not included in this tree. config/mia-512k.env.example loads
+Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw, a byte-identical mirror of brandonmusic/GLM-5.3-Flash-tr3-4bpw by
+Brandon M. Music, under the ShapleyMcg License v1.0 (https://github.com/brandonmmusic-max/shapleymcg).
+That license is attribution-required and source-available. It grants no rights to the person known as
+"0xSero." The base model is zai-org/GLM-5.3-Flash (MIT). patches/0420 copies BF16 o_proj from
+dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4 into layers 15-44 at load; the donor file is not shipped.
+DFlash2 (incoai/GLM-5.3-Flash-DFlash2) is CC BY-NC-ND 4.0 and is not shipped. The recipe is docs/MIA-512K.md.
+README sections and docs/RESULTS.md that name neko-legends weights are the imported measurements from the
+Jay Leaton tree this fork started from. They are a different stack.
+
 This project builds on third-party work that keeps its own license:
 
 TensorFold

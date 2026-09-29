@@ -1,5 +1,8 @@
 # Plan — GLM-5.3-Flash (abliterated) on TensorFold, 2× DGX Spark
 
+> Historical plan for the imported neko-legends stack. The serve this fork is running is
+> [`MIA-512K.md`](MIA-512K.md) (Mia TR3 weights, Dealign `o_proj` transplant, 524,288 latent FP8).
+
 ## Goal
 
 Serve our abliterated GLM-5.3-Flash (`neko-legends/GLM-5.3-Flash-Uncensored-EXL3` @ `07135ec0`, the weights the

@@ -1,32 +1,210 @@
-Follow me on X for more updates: https://x.com/jayleaton
+# GLM-5.3-Flash EXL3 on TensorFold, 2× DGX Spark
 
-# GLM-5.3-Flash on TensorFold, 2x NVIDIA DGX Spark
+This fork serves **Mia's TR3 EXL3 checkpoint** on [TensorFold](https://github.com/ashhart/TensorFold), with a
+load-time abliteration transplant, across two NVIDIA DGX Sparks (GB10, tensor parallel 2, CX7). OpenAI-compatible
+API, no key. The measured profile is **524,288 tokens** of context with **FP8 latent KV**, one sequence at a time.
+Full recipe: [`docs/MIA-512K.md`](docs/MIA-512K.md). Copy-paste config:
+[`config/mia-512k.env.example`](config/mia-512k.env.example).
 
-Serve GLM-5.3-Flash (the abliterated EXL3 4-bit checkpoint
-[`neko-legends/GLM-5.3-Flash-Uncensored-EXL3`](https://huggingface.co/neko-legends/GLM-5.3-Flash-Uncensored-EXL3))
-across two NVIDIA DGX Sparks, tensor-parallel over the 200 Gb/s CX7 link, behind an OpenAI-compatible API. The
-engine is [TensorFold](https://github.com/ashhart/TensorFold) (pinned, unmodified submodule) plus 57 patches applied
-at image build: 4-bit non-expert weights, a latent (absorbed MLA) KV cache, fast chunked prefill, a multi-session
-state cache with an NVMe tier, batching of up to 4 requests over a shared 1M-token KV pool, FP8 KV storage,
-shared system-prompt reuse, a RoCE all-gather, fast restarts, deeper drafting and verify windows, and ops tooling.
-Every patch is off by default; the configs in `config/` turn on the measured set, and
-[`docs/PATCHES.md`](docs/PATCHES.md) records the ones that were measured and not adopted.
-
-> **Work in progress.** This is an experimental setup, measured on one pair of Sparks. Knobs, defaults, APIs and
-> numbers may change between commits. Read [Limits](#limits-and-negatives) before relying on it.
-
-Weights attribution (the checkpoint's license requires it): the weights are by **Local Inference Lab, Inc.**
-(<https://local-inference-lab.ai/>), upstream source
-<https://huggingface.co/neko-legends/GLM-5.3-Flash-Uncensored-EXL3>, under the ShapleyMCG License 1.0. They are not
-included here. See [Licensing](#licensing).
+> **Work in progress.** One pair of Sparks, one boot, one shot per cell. Not a 1M-context acceptance test, and
+> not the imported Jayleaton stack further down this page.
 
 SPDX-License-Identifier: Apache-2.0 (this project's own code, scripts, benchmarks and docs; see [Licensing](#licensing)).
 
+The weights are not in this repo. This work uses ShapleyMcg, created by Brandon M. Music
+(<https://github.com/brandonmmusic-max/shapleymcg>). ShapleyMcg is licensed under the ShapleyMcg License v1.0,
+an attribution-required source-available license that grants no rights to the person known as "0xSero."
+Use without that attribution is unlicensed. The base model is `zai-org/GLM-5.3-Flash` (MIT).
+
+## This serve (2026-09-29)
+
+| | |
+| --- | --- |
+| Weights | [`Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw) @ `25a44fdbf16862a46b7cc9921142c6c81350af2f` (byte-identical mirror of [`brandonmusic/GLM-5.3-Flash-tr3-4bpw`](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw) @ `5ab363a8dcf6405955fd5f99671e01a1c9fb124b`). Not pre-abliterated. |
+| Abliteration | Load-time transplant of BF16 `self_attn.o_proj` from a Dealign donor, **layers 15–44 only**. Layer 45 is in the donor and is left stock (it is the MTP block). `mtp=False`. Post-copy `mean rel_l2=0.0000`. |
+| Drafter | [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2) @ `dc77ff1c99eeb2df044ee3d4f0094eb033fee410` (CC BY-NC-ND 4.0, not bundled), k=7, threshold depth |
+| Engine | TensorFold **0.3.4** (`vendor/TensorFold` @ `2f8e514`) plus `patches/` through **0420**. Image `glm53-tensorfold:dev` @ `sha256:cdcc670ac30458d27aa2bd7f2e0e1a67d8785646071a0289bc5778288dda2bc7`, built 2026-09-29 from `nvcr.io/nvidia/pytorch:26.07-py3`. Not TensorFold 0.3.7. |
+| KV | Latent FP8. Engine log: `7.4 KB a token a rank (524296 slots, 3.72 GB)`. Requested `CONTEXT=524288`. |
+| Batch | `GLM53_TF_BATCH=2` requested. The engine served **1** sequence: 3.96 GB a sequence at that cache, with 4 GB kept free. |
+| Link | NCCL on the crossed CX7. RoCE off. Non-experts **bf16** (not q4mse). Graphs on. |
+| API | `GLM-5.3-Flash-EXL3` on port **8888**. First start ready in **970 s**. |
+
+TensorFold prints, on every EXL3 launch, that the MLX checkpoint is tested more. That line is not this boot.
+The process loaded the Mia snapshot above.
+
+Steady decode on the Explain and Code prompts is about **34–53 tok/s**. A 3,556-token prefill is about
+**263–317 tok/s** (about 12–14 s). Every measured request returned HTTP 200. Receipts:
+[`results/mia-512k/`](results/mia-512k/README.md).
+
+## How this build is made
+
+### Weights
+
+Routed experts are EXL3 (trellis + suh + svh + mcg, 4-bit). Attention, the shared expert, dense layers and
+the head stay BF16 in the checkpoint (`num_hidden_layers=45`, `kv_lora_rank=512`, one MTP layer). Mia's AI Lab
+re-hosts Brandon M. Music's TR3 snapshot so the Spark recipe still has a fetch target. This repo does not
+re-quantize those BF16 matrices: `GLM53_TF_NONEXPERT=bf16`. Patch 0001's `q4mse` path is a different model
+(and the transplant refuses it, because it would quantize the tensors just copied).
+
+### Abliteration
+
+Nothing on disk is rewritten. `patches/0420` copies donor columns into `o_proj` while the rank's slice of the
+checkpoint is on CPU, before any 4-bit quant and before graphs. The donor is the full unsharded tensor; `o_proj`
+is a column split of the last axis, so rank `r` of 2 takes columns `[r*half:(r+1)*half]`.
+
+The donor is the published Dealign edit: BF16 `model.language_model.layers.{15–45}.self_attn.o_proj.weight`
+from [`dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4`](https://huggingface.co/dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4),
+the `dealign-oproj-transplant` method described with
+[drowzeys/keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock](https://huggingface.co/drowzeys/keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock).
+Thirty-one tensors. Wide layers `{15,19,23,27,31,35,39,43,45}` are `[4096, 16384]`; the others are `[4096, 8192]`.
+No key is named `mtp`. The file is not in git. Both nodes mount the same host path at `/ablit/donor.safetensors`.
+
+Layers **0–14** stay the Mia checkpoint (the load fails if they change). Layers **15–44** are replaced.
+`layers.45` is present in the donor and is **not** applied: this engine's `num_hidden_layers` is 45, so
+`layers.45` is the MTP block. The log says `mtp=False`. Do not extend the range to 45 to "match" the donor.
+
+Projection orthogonalization is not used. On this model that direction was measured as noise; the byte copy is
+the edit. The acceptance line from this boot (rank 0; rank 1's pre-copy distance was 0.1269):
+
+Both ranks logged `method=transplant layers=15-44 mtp=False mean rel_l2=0.0000 donor_layer_45=present_not_applied`,
+with `edited` equal to 15 through 44 and `guarded` equal to 0 through 14. Rank 0's `pre_rel_l2` was 0.1280;
+rank 1's was 0.1269. `mean rel_l2` is the distance after the copy. `pre_rel_l2` is the distance before it.
+
+### TensorFold config
+
+`scripts/serve.sh` defaults to `config/prod.env` (the imported 1M / q4mse / RoCE profile). This serve does not.
+Start it with `CONFIG=config/mia-512k.env`. The example uses placeholders; fill the ssh target, the head's
+address on the CX7 link, the two Hugging Face caches, and the donor path. Interface names below are the crossed
+cable that actually came up. Same-named HCAs are not on one subnet; listing every HCA makes NCCL spin.
+
+| Knob | This boot | Not this boot |
+| --- | --- | --- |
+| `CONTEXT` | `524288` (engine allocated 524296 slots) | 1,048,576; per-head KV (`FORCE_CONTEXT` stays unset) |
+| `GLM53_TF_LATENT_KV` / `GLM53_TF_KV_DTYPE` | `1` / `fp8` | bf16 latent, or the 390 KB/token per-head cache |
+| `GLM53_TF_NONEXPERT` | `bf16` | `q4mse` |
+| `GLM53_TF_ABLIT` / `_LAYERS` | `1` / `15-44` | off, or layer 45 |
+| `GLM53_TF_COMM_BACKEND` | `nccl` | `roce` |
+| `GLM53_TF_AUTO_FDRAFTS` / `GLM53_TF_DEPTH` | `7` / `threshold` | cost-derived depth |
+| `GLM53_TF_LONGCTX_GRAPHS` | `1` | |
+| `GLM53_TF_BATCH` | `2` requested, **1** served (4 GB reserve, 3.96 GB a 512k slot) | the 4-request 1M pool |
+| Head link | `enp1s0f0np0` / `rocep1s0f0` | the same name on both nodes |
+| Worker link | `enp1s0f1np1` / `rocep1s0f1` | |
+| Also off | fat MoE, KDA BF16 large-M, KV pool, session quota, prefix share, decode overlap | |
+
+Per-head KV is about 390 KB a token a rank, about 195 GiB at 512k. That does not fit in a 121 GiB GB10 on two
+ranks or three. Latent FP8 is what makes 512k fit (about 3.7 GB a rank). The launcher is two ranks. A third
+Spark is not part of this build.
+
+The worker's Hugging Face cache has to be readable as the worker user. On this pair it is an NFS mount exported
+from the head's **CX7** address. The management network is the wrong interface (the copy crawls), and a Docker
+volume the worker user cannot read fails preflight.
+
+`GLM53_TF_EFFORT_FIELD` is unset, so a top-level OpenAI `reasoning_effort` is ignored. Thinking and effort go
+through `chat_template_kwargs`. The server default is thinking off. The template writes `Reasoning Effort: Low`
+or `High` when that is the effort, and `Max` otherwise. Requests that omit `top_k` still sample with `top_k` 20
+(`temperature` 1.0, `top_p` 0.95 from the checkpoint, then the server default). `temperature` 0 is greedy.
+
+## Speed (2026-09-29)
+
+One sequence, drafts on, `max_tokens` 256. Each prompt shape was warmed once at 24 tokens; those rows are in
+the JSONL and not in the tables. `cached_tokens` was 0 on every row, including the second pass over the same
+3,556-token passage, so the long-prefill numbers are not cache hits.
+
+Decode tok/s = `completion_tokens / tensorfold.decode_s`. Prefill tok/s = `(prompt_tokens - cached_tokens) / prefill_s`.
+Tok/round = `(completion_tokens - 1) / rounds` (the first token comes from prefill). A `*` marks fewer than 16
+output tokens: that rate is one short step, not throughput. Explain and Code are the decode measurements. The
+long passage is the prefill measurement. Short-prompt prefill tok/s is the same kind of noise.
+
+Prompts: capital of France (city only); explain binary search; a Python merge of two sorted lists; a passage
+whose first sentence names archive token `184729`, then one filler sentence repeated 220 times, then "reply
+with the number only."
+
+### Greedy (`temperature` 0)
+
+Finished 2026-09-29 19:14 UTC. [`results/mia-512k/greedy-20260929.jsonl`](results/mia-512k/greedy-20260929.jsonl).
+
+| Prompt | Thinking | In | Out | Prefill tok/s | Decode tok/s | Tok/round | Wall s | Finish |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Short question | Off | 20 | 2 | 129.2 | 24.6* | 1.0 | 0.24 | stop |
+| Short question | Low | 26 | 3 | 149.5 | 34.01* | 2.0 | 0.267 | stop |
+| Short question | High | 26 | 3 | 148.7 | 33.98* | 2.0 | 0.267 | stop |
+| Short question | Max | 26 | 23 | 147.6 | 34.87 | 3.14 | 0.84 | stop |
+| Explain | Off | 24 | 256 | 138.9 | 37.16 | 3.45 | 7.067 | length |
+| Explain | Low | 30 | 239 | 95.3 | 37.17 | 3.4 | 6.749 | stop |
+| Explain | High | 30 | 256 | 156.7 | 35.28 | 3.45 | 7.452 | length |
+| Explain | Max | 30 | 256 | 154.5 | 42.49 | 3.98 | 6.224 | length |
+| Code | Off | 29 | 217 | 153.0 | 48.17 | 4.5 | 4.699 | stop |
+| Code | Low | 35 | 143 | 104.1 | 53.4 | 5.26 | 3.018 | stop |
+| Code | High | 35 | 178 | 164.1 | 51.77 | 5.06 | 3.656 | stop |
+| Code | Max | 35 | 256 | 164.4 | 45.29 | 4.25 | 5.87 | length |
+| Long passage | Off | 3556 | 4 | 300.8 | 41.97* | 3.0 | 11.924 | stop |
+| Long passage | Low | 3562 | 5 | 286.5 | 21.73* | 2.0 | 12.674 | stop |
+| Long passage | High | 3562 | 5 | 284.7 | 23.06* | 2.0 | 12.737 | stop |
+| Long passage | Max | 3562 | 30 | 262.6 | 42.93 | 4.14 | 14.272 | stop |
+
+Explain Low's prefill (95.3 tok/s, `prefill_s` 0.3149) is a short-prompt blip, not a slower prefill mode.
+Max on Explain and Code used the whole 256-token cap inside the think block and returned no answer
+(`content` empty, 918 and 1,032 reasoning characters). Low and High wrote no `reasoning_content` on the short,
+explain, and long prompts. Code High wrote 70 characters of it. Answers that were checked: `Paris`, and
+`184729` on every long-passage row.
+
+### Sampled (`temperature` 1.0, `top_p` 0.95, `top_k` 20)
+
+Finished 2026-09-29 19:20 UTC. [`results/mia-512k/sampled-20260929.jsonl`](results/mia-512k/sampled-20260929.jsonl).
+Same prompts and cap.
+
+| Prompt | Thinking | In | Out | Prefill tok/s | Decode tok/s | Tok/round | Wall s | Finish |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Short question | Off | 20 | 2 | 96.2 | 18.48* | 1.0 | 0.32 | stop |
+| Short question | Low | 26 | 3 | 112.7 | 29.76* | 2.0 | 0.335 | stop |
+| Short question | High | 26 | 3 | 104.7 | 23.26* | 2.0 | 0.381 | stop |
+| Short question | Max | 26 | 19 | 104.9 | 35.43 | 4.5 | 0.788 | stop |
+| Explain | Off | 24 | 256 | 98.3 | 34.73 | 3.15 | 7.62 | length |
+| Explain | Low | 30 | 256 | 156.1 | 36.57 | 3.19 | 7.196 | length |
+| Explain | High | 30 | 256 | 156.2 | 33.96 | 3.04 | 7.734 | length |
+| Explain | Max | 30 | 256 | 153.7 | 36.09 | 3.11 | 7.292 | length |
+| Code | Off | 29 | 256 | 153.0 | 34.82 | 3.64 | 7.546 | length |
+| Code | Low | 35 | 143 | 163.5 | 52.85 | 5.07 | 2.924 | stop |
+| Code | High | 35 | 159 | 164.5 | 52.68 | 5.1 | 3.235 | stop |
+| Code | Max | 35 | 256 | 165.6 | 42.8 | 3.86 | 6.197 | length |
+| Long passage | Off | 3556 | 4 | 317.4 | 46.19* | 3.0 | 11.294 | stop |
+| Long passage | Low | 3562 | 5 | 264.5 | 28.15* | 2.0 | 13.65 | stop |
+| Long passage | High | 3562 | 5 | 281.9 | 18.87* | 1.33 | 12.903 | stop |
+| Long passage | Max | 3562 | 28 | 285.1 | 42.51 | 3.86 | 13.158 | stop |
+
+Sampled steady decode stays in the same band. The one clear drop is Code with thinking off: greedy 48.17 tok/s
+(217 tokens, stop, 4.5 tok/round) versus sampled 34.82 tok/s (hit the 256 cap, 3.64 tok/round). A few tok/s
+either way on the other cells is one-shot noise. `Paris` and `184729` still came back. Max on Explain and Code
+again finished inside the think block with an empty answer. Code High wrote 64 characters of reasoning; the
+other Low and High rows wrote none.
+
+These numbers are **not** the RigMark or W10 tables below. Those used other weights (`neko-legends` @ `07135ec0`),
+`q4mse` non-experts, RoCE, a 4-request pool, and other prompts.
+
+## Contents
+
+- [This serve](#this-serve-2026-09-29)
+- [How this build is made](#how-this-build-is-made)
+- [Speed](#speed-2026-09-29)
+- [Imported stack](#imported-stack-jayleaton-other-weights) (neko-legends, q4mse, 1M pool, RoCE, port 8000)
+- [Licensing](#licensing)
+- [Credits](#credits)
+
+## Imported stack (Jayleaton, other weights)
+
+The rest of this README, through [Credits](#credits), is the imported text from
+[jayleaton/glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark)
+([Jay Leaton](https://x.com/jayleaton)). It documents **his** measured stack: `neko-legends` weights, `q4mse`
+non-experts, a 4-request pool over 1,048,576 latent-FP8 tokens, RoCE, port 8000. Those sections are not the
+Mia transplant serve above. Read them for the engine this fork started from, not as this machine's current config.
+Agents: [`AGENTS.md`](AGENTS.md) is that imported procedure; the running profile is
+[`docs/MIA-512K.md`](docs/MIA-512K.md).
+
 ## Quickstart
 
-This runs exactly the production config the numbers below come from (`config/prod.env.example`: 4 concurrent
-requests, a 1,048,576-token context). AI coding agents: follow [`AGENTS.md`](AGENTS.md), which has the same steps
-with checks and fixes.
+This runs the **imported** production config (`config/prod.env.example`: 4 concurrent requests, a 1,048,576-token
+context, neko-legends weights). It is not [`config/mia-512k.env.example`](config/mia-512k.env.example). AI coding
+agents following that imported path: [`AGENTS.md`](AGENTS.md).
 
 **Prerequisites** (details in [Requirements](#requirements)): two DGX Sparks cabled CX7 to CX7 with an IP address on
 the link on each; Docker with the NVIDIA runtime on both; passwordless `ssh` from the head node to the worker (and
@@ -105,21 +283,6 @@ Without `limit.context` opencode never compacts a long session. The API has no a
 `127.0.0.1`; put a reverse proxy with auth in front of it before exposing it. Stop with `scripts/serve.sh stop`.
 Long prompts refused or cut short: [Context smaller than expected](docs/TRYING.md#10-context-smaller-than-expected).
 
-## Contents
-
-- [Quickstart](#quickstart)
-- [RigMark baseline](#rigmark-baseline-2026-09-29)
-- [Benchmarks](#benchmarks)
-- [Real-agent use](#real-agent-use)
-- [Requirements](#requirements)
-- [Ways to run it](#ways-to-run-it)
-- [Knobs](#knobs)
-- [Limits and negatives](#limits-and-negatives)
-- [Tests](#tests)
-- [Layout](#layout)
-- [Licensing](#licensing)
-- [Credits](#credits)
-
 ## RigMark baseline (2026-09-29)
 
 [RigMark](https://github.com/alexellis/rigmark) standard suite, unmodified settings (receipt and details in
@@ -138,10 +301,10 @@ Different weights and drafter policy than Alex's runs; see the notes in [`result
 
 ## Benchmarks
 
-All our numbers are on the **abliterated** checkpoint `neko-legends/GLM-5.3-Flash-Uncensored-EXL3` @ `07135ec0`, on
-one pair of DGX Sparks (GB10, TP=2), 2026-09-27 to 2026-09-29. The production numbers are from the last test window
-(W10, 2026-09-29). Full tables and methodology: [`docs/RESULTS.md`](docs/RESULTS.md) (sections W6-W10 for the current
-production config); raw JSON and the window scripts in [`results/`](results/).
+The numbers in this section are on the **imported** checkpoint `neko-legends/GLM-5.3-Flash-Uncensored-EXL3` @
+`07135ec0`, on one pair of DGX Sparks (GB10, TP=2), 2026-09-27 to 2026-09-29. They are not the Mia TR3 transplant
+serve at the top of this file. The production numbers are from the last test window (W10, 2026-09-29). Full tables
+and methodology: [`docs/RESULTS.md`](docs/RESULTS.md); raw JSON and the window scripts in [`results/`](results/).
 
 ### (a) Ours vs the vLLM production kit, same weights, same client
 
@@ -383,12 +546,12 @@ Before publishing a fork: `scripts/check-public.sh` scans the tree for private I
 | `patches/` | engine patches, applied in order at image build |
 | `docker/` | Dockerfile, entrypoint, compose file |
 | `scripts/` | `serve.sh` (build / start / stop / status / logs / canary / watchdog / gpucheck), `prepare.sh`, `gpuwatch.py` (GB10 clock / slow-state watch), `traffic-report.py` (request-log summary), systemd units, `check-public.sh` |
-| `config/` | `prod.env.example` (production, the default), earlier configs, `minimal.env.example` (32k debugging baseline) |
+| `config/` | `mia-512k.env.example` (this fork's serve), `prod.env.example` (imported Jayleaton default), earlier configs, `minimal.env.example` (32k debugging baseline) |
 | `AGENTS.md` | step-by-step setup for AI coding agents: checks, commands, expected logs, failures and fixes |
 | `bench/` | benchmark clients, MMLU-200 subset, tool-call harness, shared-prefix bench, draft-policy and lookup simulators |
 | `tests/` | patch tests (GPU) and launcher tests (host) |
-| `results/` | raw benchmark JSON and the test windows' scripts (W1-W10); logs omitted |
-| `docs/` | results, patch notes, design and analysis notes |
+| `results/` | `mia-512k/` (this fork's 2026-09-29 benches) plus the imported windows' JSON and scripts (W1-W10); logs omitted |
+| `docs/` | `MIA-512K.md` (this serve), then the imported results, patch notes, and design notes |
 
 ## Licensing
 
@@ -399,25 +562,36 @@ Before publishing a fork: `scripts/check-public.sh` scans the tree for private I
 | RoCE all-gather in `patches/0230`, fast-prefill kernels in `patches/0240` | adapted from / re-implementing [b12x](https://github.com/local-inference-lab/b12x) (Apache-2.0, Luke Alonso and the b12x contributors); details in [`NOTICE`](NOTICE). |
 | Fat-expert MoE kernel structure in `patches/0170` | adapted from the Apache-2.0 [Reederey87 kit](https://github.com/Reederey87/glm53-flash-exl3-2x-dgx-spark) (code MiaAI-Lab contributed under MIT before 2026-09-07); its NOTICE is reproduced in [`NOTICE`](NOTICE). The BF16 KDA copy in the same patch re-implements an idea from MiaAI-Lab PR #233 without its code. |
 | Docker base image | NVIDIA Deep Learning Container License (`nvcr.io/nvidia/pytorch:26.07-py3`) |
-| Model weights (not included) | `neko-legends/GLM-5.3-Flash-Uncensored-EXL3`: ShapleyMCG License 1.0 per its model card (the Local Inference Lab Attribution License 1.0: MIT-like with a required attribution, given at the top of this README and in NOTICE). Its sources `orcarouter/GLM-5.3-Flash-Uncensored-FP8` and `zai-org/GLM-5.3-Flash` are MIT per their model cards. The weights are abliterated (refusals removed); you are responsible for how you use them. |
-| DFlash2 drafter (not included) | `incoai/GLM-5.3-Flash-DFlash2`: **CC BY-NC-ND 4.0, non-commercial only**. Never bundled; download it yourself, or run without it (MTP drafts only). |
+| Model weights, this serve (not included) | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` @ `25a44fdb`, a byte-identical mirror of `brandonmusic/GLM-5.3-Flash-tr3-4bpw` @ `5ab363a8`. ShapleyMcg License 1.0 (Brandon M. Music): source-available, attribution required, no rights granted to the person known as "0xSero." The required notice is at the top of this README. Base model `zai-org/GLM-5.3-Flash` is MIT. These shards are not pre-abliterated; the transplant is a runtime copy and is not shipped here. Do not relicense the shards as MIT. |
+| Model weights, imported measurements (not included) | `neko-legends/GLM-5.3-Flash-Uncensored-EXL3`: ShapleyMCG License 1.0 per its model card. Sources `orcarouter/GLM-5.3-Flash-Uncensored-FP8` and `zai-org/GLM-5.3-Flash` are MIT per their cards. Those weights are already abliterated. The tables below [Imported stack](#imported-stack-jayleaton-other-weights) use them. You are responsible for how you use either checkpoint. |
+| DFlash2 drafter (not included) | `incoai/GLM-5.3-Flash-DFlash2`: **CC BY-NC-ND 4.0, non-commercial only**. This serve pins `dc77ff1c`; the imported configs pin `7d74cdd`. Never bundled; download it yourself, or run without it (MTP drafts only). |
 
 ## Credits
 
+- [Brandon M. Music](https://github.com/brandonmmusic-max/shapleymcg): the TR3 / ShapleyMcg checkpoint this serve
+  loads (`brandonmusic/GLM-5.3-Flash-tr3-4bpw`, mirrored by Mia-AiLab).
+- [MiaAI-Lab](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks): the 2× Spark recipe, the TR3 mirror,
+  and the Dealign `o_proj` transplant this serve applies at load (layers 15–44 here; their vLLM recipe text says
+  15–45 including MTP).
+- [dealignai](https://huggingface.co/dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4): the donor checkpoint the
+  transplanted `o_proj` tensors come from. The donor file is not in this repo.
 - [Ash Hart / TensorFold](https://github.com/ashhart/TensorFold): the engine, kernels, drafting and server this
   project patches.
-- [MiaAI-Lab](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks) and its contributors: the GLM-5.3-Flash
-  2x DGX Spark vLLM kit, the fat-expert MoE design, and the ops ideas listed in `docs/MIA-AUDIT.md`.
+- [Jay Leaton](https://github.com/jayleaton/glm53-tensorfold-spark): the imported engine patches, launcher, and
+  the neko-legends measurements kept below.
+- [MiaAI-Lab](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks) and its contributors, for the
+  imported engine work: the fat-expert MoE design and the ops ideas listed in `docs/MIA-AUDIT.md`.
 - [Reederey87](https://github.com/Reederey87/glm53-flash-exl3-2x-dgx-spark): the production vLLM kit we measured
   against and the Apache-2.0 kernel code `patches/0170` adapts.
 - [local-inference-lab/b12x](https://github.com/local-inference-lab/b12x) (Luke Alonso and contributors): the RoCE
   one-shot all-gather `patches/0230` ports and the kernel designs `patches/0240` / `0360` re-implement.
-- [0xSero](https://huggingface.co/0xSero): GLM-5.3-Flash EXL3 builds and DGX Spark recipes.
+- [0xSero](https://huggingface.co/0xSero): imported credit for other GLM-5.3-Flash EXL3 builds and Spark recipes.
+  That credit is not a right to the ShapleyMcg checkpoint this serve loads. The ShapleyMcg License grants none.
 - [neko-legends](https://huggingface.co/neko-legends) (abliterated EXL3 weights, under Local Inference Lab's
   ShapleyMCG license) and [orcarouter](https://huggingface.co/orcarouter/GLM-5.3-Flash-Uncensored-FP8) (the
   uncensored FP8 source).
-- [brandonmusic](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw): the TR3 4-bit EXL3 weights the other
-  kits publish their numbers on.
+- [brandonmusic](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw): the TR3 checkpoint itself. Other kits
+  publish numbers on it; this serve loads the Mia mirror of the same snapshot.
 - [turboderp / ExLlamaV3](https://github.com/turboderp-org/exllamav3): the EXL3 format.
 - [incoai](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2): the DFlash2 drafter.
 - [Z.ai](https://huggingface.co/zai-org/GLM-5.3-Flash): GLM-5.3-Flash.

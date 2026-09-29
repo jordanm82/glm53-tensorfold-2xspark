@@ -1,5 +1,8 @@
 # Changes summary
 
+> **Imported log.** The numbers below are the Jayleaton stack on `neko-legends/GLM-5.3-Flash-Uncensored-EXL3`,
+> not this fork's Mia TR3 + transplant serve. That serve is [`MIA-512K.md`](MIA-512K.md).
+
 > **Work in progress.** Every number below comes from one pair of DGX Sparks and the abliterated checkpoint
 > `neko-legends/GLM-5.3-Flash-Uncensored-EXL3`, over three days (2026-09-27 to 2026-09-29). Statuses and defaults may
 > change. What changed since the initial public release: [Update 2026-09-29](#update-2026-09-29-patches-0230-0410-test-windows-w1-w10).

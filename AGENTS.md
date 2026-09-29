@@ -1,10 +1,16 @@
 # AGENTS.md: setting this up on 2x DGX Spark
 
-Instructions for AI coding agents (and people) bringing up GLM-5.3-Flash on TensorFold across two DGX Sparks. The goal
-is to run **exactly the author's production config** (`config/prod.env.example`): 4 concurrent requests, a
-1,048,576-token context, FP8 latent KV, the RoCE all-gather. Follow the steps in order; run each check and stop on
-a failure. Ask the user before anything that changes system state outside this repo (installing packages, editing
-network config, `sudo`, deleting files).
+> **Imported procedure.** The steps below bring up Jayleaton's `config/prod.env.example` (neko-legends weights,
+> `q4mse`, 4 requests, 1,048,576 tokens, RoCE, the same NCCL device name on both nodes). This fork's running
+> profile is different: [`docs/MIA-512K.md`](docs/MIA-512K.md) and [`config/mia-512k.env.example`](config/mia-512k.env.example)
+> (Mia TR3, Dealign `o_proj` transplant layers 15–44, bf16 non-experts, latent FP8, 524,288 tokens, NCCL, **per-rank**
+> CX7 names on a crossed cable, port 8888). Start that one with `CONFIG=config/mia-512k.env`. Do not follow the
+> weight download or the "same interface name on both nodes" rule below if the goal is the Mia serve.
+
+Instructions for AI coding agents (and people) bringing up the **imported** production config across two DGX Sparks:
+4 concurrent requests, a 1,048,576-token context, FP8 latent KV, the RoCE all-gather. Follow the steps in order; run
+each check and stop on a failure. Ask the user before anything that changes system state outside this repo
+(installing packages, editing network config, `sudo`, deleting files).
 
 Terms: **head** = the Spark you run commands on (rank 0, serves the API). **worker** = the other Spark (rank 1),
 reached from the head over ssh.

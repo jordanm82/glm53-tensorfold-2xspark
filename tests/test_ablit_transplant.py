@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import struct
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-DONOR = Path("/home/jordan/models/_dealign_o_proj_l15_45/o_proj_l15_45.safetensors")
+# Not a path in git. Set ABLIT_DONOR_HOST to the local donor safetensors to check its header.
+DONOR = Path(os.environ["ABLIT_DONOR_HOST"]) if os.environ.get("ABLIT_DONOR_HOST") else None
 WIDE = {15, 19, 23, 27, 31, 35, 39, 43, 45}
 
 
@@ -178,8 +180,8 @@ def test_begin_refuses_quant_mtp_range_and_a_missing_donor(monkeypatch, tmp_path
 
 
 def test_real_donor_header_and_begin(monkeypatch):
-    if not DONOR.is_file():
-        pytest.skip("donor is not on this machine")
+    if DONOR is None or not DONOR.is_file():
+        pytest.skip("set ABLIT_DONOR_HOST to the local donor safetensors to check its header")
     header, _base = ablit.read_header(DONOR)
     layers = ablit.donor_layers_from_header(header)
     assert set(layers) == set(range(15, 46))

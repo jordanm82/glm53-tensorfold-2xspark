@@ -69,7 +69,7 @@ rejected here, so the FP8 items are listed only as not applicable.
 | `DENSE_FP8`, #281, KDA FP8 pairing | FP8 weights and activations change outputs. FP8 prefill was already rejected here |
 | [#239](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/239) SENS8 router (verify blocks restricted to 28 experts, +11.5% structured) | Changes routing, so replies change. Breaks drafted == serial against the full model |
 | InstantTensor loader (#242, #278), `CG_ESTIMATE=0`, indexer workspace rightsize (#86), `--kv-cache-memory-bytes` | vLLM loader and allocator accounting. Our buffers are sized exactly from code (docs/MEMORY-1M.md), and loading is 0140's area |
-| Abliteration transplant (`ABLIT_METHOD=transplant`, o_proj L15-45 from an NVFP4 donor) | Our checkpoint is already abliterated (neko-legends). Their `proj` method was measured ineffective, and its silent fallback garbles output |
+| Abliteration transplant (`ABLIT_METHOD=transplant`, o_proj L15-45 from an NVFP4 donor) | Written when this tree served neko-legends, which is already abliterated. **The fork's current serve is the opposite:** Mia TR3 is not pre-abliterated, and `patches/0420` transplants layers 15–44 only (layer 45 is the MTP block and stays stock). See `docs/MIA-512K.md`. Their `proj` method was measured ineffective, and its silent fallback garbles output |
 | #244 TP=4 switchless ring, #224 TP4 sparse slice, TP3 work | Two nodes only |
 | Spin-wait window (#255, +0.95% decode, -85% CPU) | vLLM EngineCore polling. Our ranks block in NCCL and `_share` |
 | Multimodal limits, #245 | No images on our server |
