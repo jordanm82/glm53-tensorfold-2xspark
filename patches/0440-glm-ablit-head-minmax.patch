@@ -1,0 +1,51 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/ablit.py b/src/tensorfold/families/glm5_next/cuda/ablit.py
+--- a/src/tensorfold/families/glm5_next/cuda/ablit.py
++++ b/src/tensorfold/families/glm5_next/cuda/ablit.py
+@@ -9,6 +9,7 @@
+ 
+ ``q4`` / ``q4mse`` (patches/0430) quantize every other non-expert. An edit-layer
+ ``o_proj`` stays BF16: ``keeps_bf16`` and ``q4`` skip it after the copy.
++``lm_head`` under ``q4mse`` is plain min/max 4-bit (patches/0440), not the clip search.
+ 
+ The donor is the full unsharded tensor. ``o_proj`` is a column split of the last
+ axis (``split.rule``); rank ``r`` of ``world`` takes columns
+@@ -220,6 +221,8 @@
+         "donor_sha256": sha256_file(path),
+         "nonexpert": nonexpert_mode(),
+         "o_proj": "edit-bf16",
++        # q4mse stores this matrix as min/max. A folder whose head used the clip search must not match.
++        "lm_head": "minmax" if nonexpert_mode() == "q4mse" else nonexpert_mode(),
+     }
+ 
+ 
+@@ -382,7 +385,12 @@
+             raise AblitError(f"donor layer {i} is not a BF16 matrix whose last dim splits across {world} ranks ({info})")
+     _session = _Session(rank, world, n_layers, spec, edit, path, header, base)
+     if rank == 0 and nonexpert_mode() != "bf16":
+-        print(f"[ablit] o_proj layers {spec} stay BF16; other non-experts are {nonexpert_mode()}", flush=True)
++        head_store = "minmax" if nonexpert_mode() == "q4mse" else nonexpert_mode()
++        print(
++            f"[ablit] o_proj layers {spec} stay BF16; lm_head is {head_store}; "
++            f"other non-experts are {nonexpert_mode()}",
++            flush=True,
++        )
+ 
+ 
+ def keeps_bf16(name: str) -> bool:
+diff --git a/src/tensorfold/families/glm5_next/cuda/weights.py b/src/tensorfold/families/glm5_next/cuda/weights.py
+--- a/src/tensorfold/families/glm5_next/cuda/weights.py
++++ b/src/tensorfold/families/glm5_next/cuda/weights.py
+@@ -428,7 +428,12 @@
+     draft_head = None
+     if exl3:
+         hw = rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev)
+-        head = nonexpert(hw)
++        # patches/0440: q4mse clip search on this matrix flattened the EOS margin under sampling.
++        # Plain min/max is the same 4-bit kernel and the same bytes. Every other nonexpert() stays mse.
++        if NONEXPERT == "q4mse":
++            head = quantize4(hw.to(torch.bfloat16), mse=False)
++        else:
++            head = nonexpert(hw)
+         # MTP and DFlash2 steps read 0.18 GB a rank instead of 0.63; a 4-bit head already is that copy
+         draft_head = quantize4(hw.to(torch.bfloat16)) if isinstance(head, B16) else None
+         del hw

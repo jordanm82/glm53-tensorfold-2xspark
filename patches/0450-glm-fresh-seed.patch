@@ -1,0 +1,40 @@
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -351,17 +351,23 @@
+         return self.tok.encode(text, add_special_tokens=False).ids
+ 
+     def sampling_for(self, body: dict[str, Any], prompt: list[int]):
+-        """Keyed sampling (the seed, else one drawn from the prompt), or None for greedy decoding."""
++        """Keyed sampling, or None for greedy. An explicit seed replays. An omitted seed is a fresh
++        draw on this rank (patches/0450), not a hash of the prompt."""
+ 
+-        from tensorfold.engine.exact_sampling import Sampling, seed_for
++        import secrets
++
++        from tensorfold.engine.exact_sampling import Sampling
+ 
+         temp = float(body["temperature"] if body.get("temperature") is not None else self.sampling["temperature"])
+         if temp <= 0:
+             return None
+-        seed = body.get("seed")
++        raw = body.get("seed")
+         top_k = body["top_k"] if body.get("top_k") is not None else self.sampling["top_k"]
+         top_p = body["top_p"] if body.get("top_p") is not None else self.sampling["top_p"]
+-        return Sampling(int(seed) if seed is not None else seed_for(prompt), temp, int(top_k), float(top_p))
++        # patches/0450: rank 0 only. The job header carries this seed, so rank 1 does not draw its own.
++        # 53 bits: tensorfold.seed is a JSON number, and browsers and jq keep integers only through 2**53 - 1.
++        seed = int(raw) if raw is not None else secrets.randbits(53)
++        return Sampling(seed, temp, int(top_k), float(top_p))
+ 
+     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+         tools = body.get("tools") or []
+@@ -424,6 +430,8 @@
+         with self.lock:
+             stats = self.engine.generate(prompt, max_tokens, sampling, on_tokens,
+                                          **({} if draft else {"draft": False}))
++        if sampling is not None and isinstance(stats, dict):
++            stats["seed"] = int(sampling.seed)          # patches/0450: the seed this reply used
+         reasoning, answer = visible(True)
+         final: dict[str, Any] = {}
+         if len(reasoning) > sent["reasoning"]:

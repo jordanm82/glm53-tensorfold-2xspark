@@ -303,12 +303,12 @@ preflight() { # read-only checks (AGENTS.md lists them); non-zero on a problem a
         wssh sudo -n true 2>/dev/null || log "preflight: warning: no passwordless sudo -n on the worker: the memory gate cannot drop page caches"
     fi
     if gpu_busy; then log "preflight: a CUDA process is running on a node (nvidia-smi): stop the other stack (vLLM, ...) first"; bad=1; fi
-    # patches/0420: transplant refuses a missing donor and refuses q4/q4mse (that would quantize the copy)
+    # patches/0420 + 0430: the donor must exist. q4/q4mse is allowed; edit-layer o_proj stays BF16.
     case "${GLM53_TF_ABLIT:-0}" in
         1|on|yes|true)
             case "${GLM53_TF_NONEXPERT:-bf16}" in
-                bf16) ;;
-                *) log "preflight: GLM53_TF_ABLIT=1 refuses GLM53_TF_NONEXPERT=${GLM53_TF_NONEXPERT:-} (q4/q4mse would quantize the transplanted o_proj)"; bad=1 ;;
+                bf16|q4|q4mse) ;;
+                *) log "preflight: GLM53_TF_ABLIT=1 refuses GLM53_TF_NONEXPERT=${GLM53_TF_NONEXPERT:-} (expected bf16, q4, or q4mse)"; bad=1 ;;
             esac
             if [[ -z "${ABLIT_DONOR_HOST:-}" ]]; then
                 log "preflight: ABLIT_DONOR_HOST is not set"

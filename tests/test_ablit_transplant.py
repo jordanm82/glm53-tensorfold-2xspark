@@ -20,7 +20,7 @@ DONOR = Path(os.environ["ABLIT_DONOR_HOST"]) if os.environ.get("ABLIT_DONOR_HOST
 WIDE = {15, 19, 23, 27, 31, 35, 39, 43, 45}
 
 
-def load_ablit():
+def _ablit_source_from_0420() -> str:
     text = (ROOT / "patches" / "0420-glm-ablit-transplant.patch").read_text()
     start = text.index("+++ i/src/tensorfold/families/glm5_next/cuda/ablit.py\n")
     rest = text[start:].splitlines()[1:]  # drop the +++ line; next is the hunk header
@@ -33,7 +33,27 @@ def load_ablit():
             continue
         assert line.startswith("+"), line
         body.append(line[1:])
-    src = "\n".join(body) + "\n"
+    return "\n".join(body) + "\n"
+
+
+def load_ablit():
+    """0420's module with 0430 and 0440 applied: the ablit.py the image actually runs."""
+    import subprocess
+    import tempfile
+
+    src = _ablit_source_from_0420()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        dest = root / "src/tensorfold/families/glm5_next/cuda/ablit.py"
+        dest.parent.mkdir(parents=True)
+        dest.write_text(src)
+        for name in ("0430-glm-ablit-q4mse-skip.patch", "0440-glm-ablit-head-minmax.patch"):
+            patch = ROOT / "patches" / name
+            subprocess.run(
+                ["git", "apply", f"--include={dest.relative_to(root)}", str(patch)],
+                cwd=root, check=True,
+            )
+        src = dest.read_text()
     spec = importlib.util.spec_from_loader("ablit_under_test", loader=None)
     mod = importlib.util.module_from_spec(spec)
     exec(compile(src, "ablit.py", "exec"), mod.__dict__)
@@ -154,11 +174,34 @@ def test_finalize_refuses_a_moved_anchor_or_mtp():
         ablit.finalize(sloppy, edit=edit, n_layers=2, donor_has_45=False)
 
 
-def test_begin_refuses_quant_mtp_range_and_a_missing_donor(monkeypatch, tmp_path):
+def test_q4mse_skip_patch_keeps_edit_oproj_bf16():
+    text = (ROOT / "patches" / "0430-glm-ablit-q4mse-skip.patch").read_text()
+    assert "keeps_bf16" in text and "make_b16(t(weight))" in text
+    assert "nonexpert(t(weight))" in text
+    assert "expected bf16, q4, or q4mse" in text
+    assert 'o_proj": "edit-bf16"' in text
+
+
+def test_head_minmax_patch_skips_clip_search_on_lm_head_only():
+    text = (ROOT / "patches" / "0440-glm-ablit-head-minmax.patch").read_text()
+    assert 'if NONEXPERT == "q4mse":' in text
+    assert "quantize4(hw.to(torch.bfloat16), mse=False)" in text
+    assert "head = nonexpert(hw)" in text
+    assert '"lm_head": "minmax"' in text
+    added = [line[1:] for line in text.splitlines() if line.startswith("+") and not line.startswith("+++")]
+    # The shared quantizer stays on the mse path. This patch must not rewrite it or the o_proj skip.
+    assert not any("mse=NONEXPERT" in line for line in added)
+    assert not any("keeps_bf16" in line for line in added)
+
+
+def test_begin_allows_q4mse_and_refuses_mtp_range_and_a_missing_donor(monkeypatch, tmp_path):
     monkeypatch.setenv("GLM53_TF_ABLIT", "1")
-    monkeypatch.setenv("GLM53_TF_NONEXPERT", "q4mse")
+    monkeypatch.setenv("GLM53_TF_NONEXPERT", "nope")
     monkeypatch.setenv("GLM53_TF_ABLIT_DONOR", str(tmp_path / "missing.safetensors"))
-    with pytest.raises(ablit.AblitError, match="q4mse"):
+    with pytest.raises(ablit.AblitError, match="nope"):
+        ablit.cache_extra()
+    monkeypatch.setenv("GLM53_TF_NONEXPERT", "q4mse")
+    with pytest.raises(ablit.AblitError, match="missing"):
         ablit.cache_extra()
     monkeypatch.setenv("GLM53_TF_NONEXPERT", "bf16")
     with pytest.raises(ablit.AblitError, match="missing"):
@@ -177,6 +220,39 @@ def test_begin_refuses_quant_mtp_range_and_a_missing_donor(monkeypatch, tmp_path
     assert ablit.cache_extra() == {"on": False}
     ablit.begin(rank=0, world=2, n_layers=45)  # off: does not read the donor
     assert ablit.finish() is None
+    assert ablit.keeps_bf16("layers.15.self_attn.o_proj.weight") is False
+
+
+def test_q4mse_keeps_only_the_edit_layers(monkeypatch, tmp_path):
+    payload = pack([[1, 2, 3, 4]])
+    tensors = {ablit.donor_key(i): ([1, 4], payload) for i in range(15, 46)}
+    path = tmp_path / "donor.safetensors"
+    write_safetensors(path, tensors)
+    monkeypatch.setenv("GLM53_TF_ABLIT", "1")
+    monkeypatch.setenv("GLM53_TF_NONEXPERT", "q4mse")
+    monkeypatch.setenv("GLM53_TF_ABLIT_DONOR", str(path))
+    monkeypatch.setenv("GLM53_TF_ABLIT_LAYERS", "15-44")
+    extra = ablit.cache_extra()
+    assert extra["nonexpert"] == "q4mse" and extra["o_proj"] == "edit-bf16"
+    assert extra["lm_head"] == "minmax"
+    monkeypatch.setenv("GLM53_TF_NONEXPERT", "q4")
+    assert ablit.cache_extra()["lm_head"] == "q4"
+    monkeypatch.setenv("GLM53_TF_NONEXPERT", "bf16")
+    assert ablit.cache_extra()["lm_head"] == "bf16"
+    monkeypatch.setenv("GLM53_TF_NONEXPERT", "q4mse")
+    ablit.begin(rank=0, world=2, n_layers=45)
+    try:
+        assert ablit.keeps_bf16("layers.15.self_attn.o_proj.weight")
+        assert ablit.keeps_bf16("layers.44.self_attn.o_proj.weight")
+        assert not ablit.keeps_bf16("layers.14.self_attn.o_proj.weight")
+        assert not ablit.keeps_bf16("layers.45.self_attn.o_proj.weight")
+        assert not ablit.keeps_bf16("layers.45.mtp_block.self_attn.o_proj.weight")
+        assert not ablit.keeps_bf16("layers.20.mlp.down_proj.weight")
+        monkeypatch.setenv("GLM53_TF_NONEXPERT", "bf16")
+        assert not ablit.keeps_bf16("layers.15.self_attn.o_proj.weight")
+    finally:
+        monkeypatch.setenv("GLM53_TF_ABLIT", "0")
+        ablit.begin(rank=0, world=2, n_layers=45)
 
 
 def test_real_donor_header_and_begin(monkeypatch):

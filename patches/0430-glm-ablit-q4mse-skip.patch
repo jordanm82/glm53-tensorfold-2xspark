@@ -1,0 +1,95 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/ablit.py b/src/tensorfold/families/glm5_next/cuda/ablit.py
+--- a/src/tensorfold/families/glm5_next/cuda/ablit.py
++++ b/src/tensorfold/families/glm5_next/cuda/ablit.py
+@@ -7,8 +7,8 @@
+ left stock and the log says ``mtp=False``. A name under ``mtp_block`` is left stock
+ too. There is no projection fallback: a missing donor refuses the load.
+ 
+-``GLM53_TF_NONEXPERT`` must stay ``bf16``. ``q4`` / ``q4mse`` would quantize the
+-tensors just copied.
++``q4`` / ``q4mse`` (patches/0430) quantize every other non-expert. An edit-layer
++``o_proj`` stays BF16: ``keeps_bf16`` and ``q4`` skip it after the copy.
+ 
+ The donor is the full unsharded tensor. ``o_proj`` is a column split of the last
+ axis (``split.rule``); rank ``r`` of ``world`` takes columns
+@@ -180,10 +180,12 @@
+ 
+ 
+ def _refuse_quant() -> None:
++    """``q4`` / ``q4mse`` are allowed. ``keeps_bf16`` leaves the transplanted rows in BF16."""
++
+     mode = nonexpert_mode()
+-    if mode != "bf16":
++    if mode not in ("bf16", "q4", "q4mse"):
+         raise AblitError(
+-            f"GLM53_TF_ABLIT=1 refuses GLM53_TF_NONEXPERT={mode!r}: q4/q4mse would quantize the transplanted o_proj"
++            f"GLM53_TF_ABLIT=1 refuses GLM53_TF_NONEXPERT={mode!r}: expected bf16, q4, or q4mse"
+         )
+ 
+ 
+@@ -217,6 +219,7 @@
+         "donor": path,
+         "donor_sha256": sha256_file(path),
+         "nonexpert": nonexpert_mode(),
++        "o_proj": "edit-bf16",
+     }
+ 
+ 
+@@ -378,6 +381,21 @@
+         if info.get("dtype") != "BF16" or len(shape) != 2 or int(shape[1]) % world:
+             raise AblitError(f"donor layer {i} is not a BF16 matrix whose last dim splits across {world} ranks ({info})")
+     _session = _Session(rank, world, n_layers, spec, edit, path, header, base)
++    if rank == 0 and nonexpert_mode() != "bf16":
++        print(f"[ablit] o_proj layers {spec} stay BF16; other non-experts are {nonexpert_mode()}", flush=True)
++
++
++def keeps_bf16(name: str) -> bool:
++    """True for an edit-layer ``o_proj`` while non-experts are stored in 4 bits.
++
++    ``q4`` calls this after ``maybe_transplant``. Guard layers, the MTP block, and
++    every other tensor follow ``GLM53_TF_NONEXPERT``. ``bf16`` has nothing to skip.
++    """
++
++    if _session is None or nonexpert_mode() == "bf16":
++        return False
++    kind, _layer = classify(name, _session.n_layers, _session.edit)
++    return kind == "edit"
+ 
+ 
+ def _torch_bytes(tensor) -> bytes:
+diff --git a/src/tensorfold/families/glm5_next/cuda/weights.py b/src/tensorfold/families/glm5_next/cuda/weights.py
+--- a/src/tensorfold/families/glm5_next/cuda/weights.py
++++ b/src/tensorfold/families/glm5_next/cuda/weights.py
+@@ -298,7 +298,8 @@
+ 
+     world = 2
+     cfg = Config.read(model_dir)
+-    # patches/0420: refuse a missing donor / q4mse before the checkpoint is mapped.
++    # patches/0420: refuse a missing donor before the checkpoint is mapped.
++    # patches/0430: q4/q4mse is allowed; edit-layer o_proj stays BF16 inside q4().
+     ablit.begin(rank=rank, world=world, n_layers=cfg.layers)
+     if cfg.quant not in ("mlx", "exl3"):
+         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
+@@ -312,8 +313,7 @@
+         x = rd.get(PREFIX + name)
+         if dtype is not None:
+             x = x.to(dtype)
+-        # Transplant while the tensor is still on the CPU. q4() quantizes whatever this returns,
+-        # so ablit refuses GLM53_TF_NONEXPERT other than bf16 before we get here.
++        # Transplant on the CPU. q4() keeps an edit-layer o_proj in BF16 and quantizes the rest.
+         x = ablit.maybe_transplant(name, x)
+         return x.to(dev)
+ 
+@@ -321,7 +321,11 @@
+         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
+ 
+     def q4(name: str) -> Q4 | B16:
+-        return nonexpert(t(name + ".weight")) if exl3 else make_q4(*trip(name))
++        # patches/0430: transplanted o_proj stays BF16. Other EXL3 non-experts follow GLM53_TF_NONEXPERT.
++        weight = name + ".weight"
++        if exl3 and ablit.keeps_bf16(weight):
++            return make_b16(t(weight))
++        return nonexpert(t(weight)) if exl3 else make_q4(*trip(name))
+ 
+     def stack(names: list[str]) -> Q4 | B16:
+         if exl3:

@@ -60,7 +60,10 @@ are the imported neko-legends stack, not that profile.
 | 0390 `glm-mla-expand-v2` | `GLM53_TF_MLA_EXPAND=v1\|v2` (load-time) | `v1` | the latent MLA absorb / expand (`latent.absorb` / `expand`: every DSA layer and the MTP head, in prefill, decode, verify and MTP steps) through `_absorb2` / `_expand2`: the same fp32 FMA chain per output element (k in order from +0.0, exactly dequantized kv_b, one bf16 rounding), retiled: 16-128 rows a program share one dequantization of the kv_b tile (v1: 16), 16-wide dot steps (v1's 64-deep dot spills 452 B in `_expand`), a head's programs adjacent. **Same bits** as v1 for every row at any row count (offline: Triton source + compiled IR + interpreter model; GPU bitwise test pending). Offline estimate: `_expand` 2,415 -> 250-450 us, `_absorb` 676 -> 200-300 us a 512-row sub-block: +7.5-8.5% prefill. `docs/MLA-EXPAND.md` **W10: GPU bitwise passed, tiles retuned (4 warps), adopted: prefill +7.1% / +6.7%.** |
 | 0400 `glm-kda-v2` | `GLM53_TF_KDA_V2=0\|1\|2` (`split` / `fused`; load-time, checked at load); `_BV`, `_WARPS`, `_MAXNREG`, `_KSPLIT`; `_FUSED_BV`, `_CTAS`, `_LAG`, `_RING`, `_FUSED_MAXNREG` | `0`; `32`, `4`, `168`, `1`; `64`, `0` (one an SM), `1`, `3`, `0` | fast chunks' KDA recurrence (`fastpf.kda_chain`, every KDA layer) through `kda_v2.kda_prefill_v2` instead of `fast_kda.kda_prefill_chunked`, **same bits** (every output row, every state / snapshot, any call size; shares snapshots, left out of the NVMe compat hash). `1` split: `fast_kda`'s prep, then a scan in 32-value-row blocks (128 programs, not 64; a head's blocks adjacent so DRAM serves each chunk's operands once; dots over two 64-key halves: 24 KB shared memory, 3 programs an SM). `2` fused: one persistent kernel takes prep and scan-step items by ticket, waits on release / acquire flags (every wait on an earlier ticket: no deadlock), the workspace a 3-chunk ring kept in L2 (not 46 MB a 512-row call through DRAM). Value columns of the state are independent; each dot is the same mma chain; reductions only in the unchanged prep. Offline: compiled IR == `fast_kda`'s op for op (3.7.1 and 3.8), interpreter bitwise at 1-8,192 rows and call splits; estimate -7..-11 (split) / -20..-35 (fused) us a token = +1-1.6% / +3-5% prefill. `docs/KDA-V2.md` **W10: bitwise passed; split +1.0-1.2% end to end, fused slower: off.** |
 | 0410 `glm-sparse-v2` | `GLM53_TF_SPARSE_V2=0\|1` (load-time); `GLM53_TF_SPARSE_V2_CFG=stages,qkl[,qreg]` | `0`; `3,1,1` (FP8), `2,0,0` (bf16) | b12x bit 4's one-pass sparse latent attention (`b12x_attn.sparse_latent_one`, production's fast-prefill sparse attention since W9) through `sparse_v2._lsparse_v2`, a Gluon kernel with **the one-pass kernel's bits** (same 32-token tiles in list order, same mma chains and kWidth 2, both reductions on the reference's own `#mma` [1, 8], same element-wise ops; row-invariant; shares bit 4's snapshots, left out of the NVMe compat hash): the selected FP8 rows gathered with `cp.async` into a 3-slot ring through the 0290 page table (the reference loads each tile synchronously, one CTA an SM), dequantized once into shared memory, the scores on [2, 4] without the reference's duplicated warps (512 mma a tile, not 768), half of q in registers (~286 KB of shared-memory traffic a tile, not ~430). Offline: compiled IR == the reference's arithmetic op for op + equal PTX float counts (3.7.1 and 3.8), CPU emulator of v2's own source (cp.async ring, barriers modelled) == the reference in the interpreter bitwise, reference PTX unchanged. Estimate 1.8-3.1x the kernel, +3.5-6% prefill. `docs/SPARSE-V2.md` **W10: engine.py syntax error fixed; FP8 bitwise passed; kernel 1.2x, end to end +0%: off.** |
-| 0420 `glm-ablit-transplant` | `GLM53_TF_ABLIT=0\|1`; `GLM53_TF_ABLIT_DONOR=PATH`; `GLM53_TF_ABLIT_LAYERS=SPEC`; host `ABLIT_DONOR_HOST` (serve.sh mounts it at the donor path) | `0`; empty; `15-44` | Load-time copy of BF16 `self_attn.o_proj` into layers 15–44 (or `SPEC`) from a full-tensor donor. Column-split of the last axis: rank `r` of 2 takes `[r*half:(r+1)*half]`. Layers 0–14 are hashed and must stay the checkpoint. `layers.{num_hidden_layers}` is the MTP block and is not edited (`mtp=False`); a donor layer 45 is logged `present_not_applied`. Refuses `q4` / `q4mse`, a missing donor, and a layer index `>= n_layers`. Post-copy mean relative L2 must be ~0. Hooked inside `load_checkpoint`, and the prepared-folder key includes `ablit.cache_extra()`, so a folder built with it off does not satisfy a boot with it on. `docs/MIA-512K.md` |
+| 0420 `glm-ablit-transplant` | `GLM53_TF_ABLIT=0\|1`; `GLM53_TF_ABLIT_DONOR=PATH`; `GLM53_TF_ABLIT_LAYERS=SPEC`; host `ABLIT_DONOR_HOST` (serve.sh mounts it at the donor path) | `0`; empty; `15-44` | Load-time copy of BF16 `self_attn.o_proj` into layers 15–44 (or `SPEC`) from a full-tensor donor. Column-split of the last axis: rank `r` of 2 takes `[r*half:(r+1)*half]`. Layers 0–14 are hashed and must stay the checkpoint. `layers.{num_hidden_layers}` is the MTP block and is not edited (`mtp=False`); a donor layer 45 is logged `present_not_applied`. Refuses a missing donor and a layer index `>= n_layers`. Post-copy mean relative L2 must be ~0. Hooked inside `load_checkpoint`, and the prepared-folder key includes `ablit.cache_extra()`, so a folder built with it off does not satisfy a boot with it on. `docs/MIA-512K.md` |
+| 0430 `glm-ablit-q4mse-skip` | `GLM53_TF_NONEXPERT=q4\|q4mse` with `GLM53_TF_ABLIT=1` | refused before this patch | Edit-layer `o_proj` stays BF16 (`keeps_bf16`). Every other EXL3 non-expert uses 0001's quantizer. The MTP block is quantized with the rest. Prepared-folder key gains `o_proj=edit-bf16`. q4mse is a different model on the quantized tensors; the donor columns are not. |
+| 0440 `glm-ablit-head-minmax` | none (still `GLM53_TF_NONEXPERT=q4mse`) | head followed `q4mse` | `lm_head` only is `quantize4(..., mse=False)` (min/max, no clip). Every other `nonexpert()` call stays on the clip search. Same 4-bit kernel and the same bytes as a q4mse head. Prepared-folder key gains `lm_head=minmax`, so a folder built with a clipped head does not match. |
+| 0450 `glm-fresh-seed` | none (a request `seed` still wins) | omitted seed was `sha256(prompt)` | A sampled request that omits `seed` draws 53 bits on rank 0. The job header carries that seed, so rank 1 matches. `tensorfold.seed` is the value to send back to replay. Temperature <= 0 stays greedy and does not set the field. `cuda/server.py` is not in the prepared-folder digest. |
 
 ## 0420 — Dealign o_proj transplant
 
@@ -83,8 +86,48 @@ apply it. The log line carries `donor_layer_45=present_not_applied` and `mtp=Fal
 15–44, guarded set 0–14. See `docs/MIA-512K.md`.
 
 **Exactness.** The transplanted tensors are a different model from stock TR3. Within one boot, drafting and
-verify read the same stored weights. `q4mse` is refused so the copy is not quantized out from under the check.
+verify read the same stored weights. Patch 0430 is what allows `q4mse` without quantizing the copy.
 This patch does not claim drafted == serial was re-measured on the 2026-09-29 serve.
+
+## 0430 — q4mse without quantizing the transplant
+
+**Problem.** 0001's decode win is the 10.7 GB/rank of BF16 non-experts. 0420 refused `q4` / `q4mse` because
+`q4()` ran `nonexpert()` on the donor columns it had just copied.
+
+**Change.** With the transplant on, `q4()` stores an edit-layer `self_attn.o_proj` with `make_b16` and runs
+`nonexpert()` on everything else, including `o_proj` outside the edit set and the MTP block. `cache_extra`
+records `o_proj=edit-bf16`, so a folder built at `bf16` or with those columns quantized does not match.
+`serve.sh` preflight allows `bf16`, `q4`, and `q4mse`.
+
+**Exactness.** The quantized tensors are not bit-identical to BF16 (0001). The transplanted columns are the
+donor bytes. Drafting and verification still read the same stored weights.
+
+## 0440 — plain min/max on `lm_head` only
+
+**Problem.** With 0430 and `GLM53_TF_NONEXPERT=q4mse`, a sampled long prompt (thinking off, temperature 1.0,
+top-p 0.95, top-k 20) copied the passage instead of stopping after the archive token. Greedy on the same
+prompt still stopped. The clip search is the suspect: it shrinks outlier channels, and the end-of-sequence
+row is usually one of them. Argmax still saw that row; sampling did not.
+
+**Change.** When `GLM53_TF_NONEXPERT=q4mse`, `lm_head` is stored with `quantize4(..., mse=False)`. `q4` and
+`bf16` are unchanged. No other `nonexpert()` call changes, and layers 15–44 `o_proj` stay BF16. A 4-bit head
+is already the draft copy, so `draft_head` stays unset. `cache_extra` records `lm_head=minmax` under `q4mse`
+(and the mode name otherwise). `weights.py` is in the prepared-folder digest, so the clipped-head folder is
+not reused either way.
+
+**Exactness.** Not bit-identical to a q4mse head. Drafting and verification still read the same stored head.
+
+**Result.** The 2026-09-30 retest did not restore the stop. Five sampled long-passage shots with thinking off (temperature 1.0, top-p 0.95, top-k 20, 16 then 64 tokens) all copied the passage and finished on length. One greedy Explain shot, thinking off, 256 tokens, decoded at 50.7 tok/s against 45.5 on the clipped head. One shot, not a median. Prepared folder stayed 83.1 GB.
+
+## 0450 — a fresh seed when the request omits one
+
+**Problem.** `sampling_for` used `seed_for(prompt)` whenever `seed` was absent. That hash is what keeps a drafted reply identical to serial decoding for one seed, and it also makes the same messages return the same words at temperature 1.0. A client that does not send `seed` cannot get a second wording of the same prompt.
+
+**Change.** Temperature <= 0 is still greedy. An explicit `seed`, including 0, is still that integer on both ranks. An omitted seed is `secrets.randbits(53)` on rank 0 only. 53 bits is the integer width a JSON number keeps in a browser and in jq. `tensorfold.seed` on the non-stream body and on the stream trailer is that number, so sending it back as `seed` replays the reply. Rank 1 already takes the seed from the job header and does not draw. `seed_for` is unchanged and is no longer used on this path. There is no environment switch.
+
+**Exactness.** Drafted output is still the serial output of the seed this request actually used. Two requests that omit `seed` are not required to match. The prepared-folder key does not include `cuda/server.py`.
+
+**Result.** The 2026-09-30 restart reused the min/max prepared folders (83.1 GB, not rebuilt) and was serving again in about two minutes. On the open rain-proverb prompt, thinking off: two omitted seeds returned different sentences and different `tensorfold.seed` values; sending the first seed back twice reproduced that sentence; seed 2 was a third sentence; temperature 0 twice was the same sentence and had no seed field.
 
 ## 0001 — EXL3 non-expert weights in 4 bits
 

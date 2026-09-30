@@ -27,8 +27,9 @@ model (`zai-org/GLM-5.3-Flash`, MIT). Mia re-hosts the snapshot.
 
 The checkpoint is about 164 GiB, 120 safetensor shards, quant `exl3` / 4-bit mcg. `num_hidden_layers` is 45,
 `kv_lora_rank` is 512, `num_nextn_predict_layers` is 1. Routed experts are the 4-bit trellis. The other
-matrices (attention projections, shared expert, dense layers, head) stay BF16. This serve does not run
-`q4mse` on them.
+matrices (attention projections, shared expert, dense layers, head) stay BF16 in the file. Patch 0430
+quantizes those at load, except layers 15–44 `o_proj`, which stay the transplanted BF16 columns. Patch 0440
+stores `lm_head` as plain min/max 4-bit when the other non-experts are `q4mse`.
 
 These weights are the stock TR3 body. They are not the `neko-legends` abliterated checkpoint, and they are
 not TensorFold's MLX recipe (`Vontra/GLM-5.3-Flash-MLX-4bit-MTP`). The engine prints that MLX line on every
@@ -75,7 +76,7 @@ missing MTP edit as a failed transplant.
 
 Projection orthogonalization is not this method. The Mia kit measured the shipped refusal direction as noise
 against stock `o_proj` (the projection variants did not reproduce the published edit; the byte copy did).
-`GLM53_TF_NONEXPERT` must stay `bf16`. `q4` and `q4mse` would quantize the copy, and the loader refuses them.
+`GLM53_TF_NONEXPERT=q4mse` (patches/0430) quantizes the other BF16 non-experts at load. Layers 15–44 `o_proj` stay BF16 after the copy, so the donor columns are not quantized. The MTP block is not in that skip. Patch 0440 leaves `lm_head` on plain min/max 4-bit instead of that clip search. The 2026-09-29 boot in the table below was still `bf16`.
 
 This boot, both ranks, after the copy: `mean rel_l2=0.0000`, `mtp=False`, edited 15 through 44, guarded 0
 through 14. Pre-copy distance was 0.1280 on rank 0 and 0.1269 on rank 1. The post-copy mean is the check
@@ -134,7 +135,7 @@ aiming at the shape of:
 
 | Left off | Why it is not in this profile |
 | --- | --- |
-| `q4mse` / `q4` | Re-quantizes the BF16 non-experts, including the tensors the transplant just wrote. The loader refuses the combination. The imported speed tables use `q4mse`; they do not describe this boot. |
+| Full `q4mse` of the transplanted `o_proj` | Refused by 0420. Patch 0430 quantizes the other non-experts and leaves layers 15–44 `o_proj` in BF16. The imported speed tables are still a different checkpoint. |
 | RoCE (`GLM53_TF_COMM_BACKEND=roce`) | This boot is NCCL on the crossed cable. |
 | Fat MoE, KDA BF16 large-M | Not set. The vLLM kit's fused-MoE and KDA flags have no equivalent turned on here. |
 | KV pool, session GiB, NVMe session tier, prefix share | Not set. `serve.sh` still mounts a sessions directory; the quota knob is off, so it is not a session cache. |
@@ -167,7 +168,7 @@ not read the README's imported "4 requests" as this process.
 
 `/v1/models` does not advertise `max_model_len`. The engine log is the context proof (524,288 requested,
 524,296 slots). The sampling line is the checkpoint's generation config before the server merges its default
-`top_k` of 20. A request that omits `top_k` still gets 20. `temperature` 0 is greedy.
+`top_k` of 20. A request that omits `top_k` still gets 20. `temperature` 0 is greedy. Patch 0450: a sampled request that omits `seed` draws a fresh 53-bit seed on rank 0 instead of hashing the prompt, and the response's `tensorfold.seed` is that value. Sending it back as `seed` replays the reply. Temperature 0 does not draw one.
 
 First boot logged `weights: no usable prepared folder (no folder): building from the checkpoint; will write it`. Rank 0 then wrote
 `/prepared/Mia-AiLab--GLM-5.3-Flash-EXL3-TR3-4bpw-25a44fdbf168/4780c85a172687a9/rank0` (88.6 GB in 117.0 s)
@@ -200,7 +201,9 @@ the first sentence.
 
 - Do not commit `config/mia-512k.env`, the donor, the weights, the drafter, or a dirty `vendor/TensorFold`.
 - Do not point `MODEL_PATH` at `neko-legends` or at the MLX repo and then describe the result as this boot.
-- Do not set `GLM53_TF_NONEXPERT=q4mse` with the transplant on. Preflight and the loader both refuse it.
+- `GLM53_TF_NONEXPERT=q4mse` with the transplant on is the 0430 skip, not a full requant of `o_proj`. The first boot after the change rebuilds the prepared folder. Layers 15–44 stay BF16.
+- Patch 0440 does not change `GLM53_TF_NONEXPERT`. It stores only `lm_head` as min/max. A prepared folder whose head used the clip search does not match.
+- Patch 0450 does not change weights. A prepared folder built before it still matches. The serve has to be restarted for the seed change; clients do not.
 - Do not set `GLM53_TF_ABLIT_LAYERS` to `15-45`. Layer 45 is the MTP block on this config.
 - Do not set `FORCE_CONTEXT=1` to "try per-head 512k". It will not fit.
 - `scripts/check-public.sh` scans tracked and untracked files for private addresses, home directories, keys

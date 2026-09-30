@@ -590,9 +590,13 @@ def test_preflight_ablit_donor(kit, tmp_path):
     missing = tmp_path / "no-donor.safetensors"
     r = kit.run("preflight", GLM53_TF_ABLIT="1", GLM53_TF_NONEXPERT="q4mse", ABLIT_DONOR_HOST=str(missing))
     assert r.returncode != 0
-    assert "q4mse" in r.stdout and "ablit donor missing" in r.stdout
+    assert "ablit donor missing" in r.stdout and "would quantize" not in r.stdout
     donor = tmp_path / "donor.safetensors"
     donor.write_bytes(b"not-read-here")
+    r = kit.run("preflight", GLM53_TF_ABLIT="1", GLM53_TF_NONEXPERT="q4mse", ABLIT_DONOR_HOST=str(donor))
+    assert r.returncode == 0 and "ablit donor missing" not in r.stdout, r.stdout + r.stderr
+    r = kit.run("preflight", GLM53_TF_ABLIT="1", GLM53_TF_NONEXPERT="q3", ABLIT_DONOR_HOST=str(donor))
+    assert r.returncode != 0 and "q3" in r.stdout
     r = kit.run("preflight", GLM53_TF_ABLIT="1", GLM53_TF_NONEXPERT="bf16", ABLIT_DONOR_HOST=str(donor))
     assert r.returncode == 0 and "ablit donor missing" not in r.stdout, r.stdout + r.stderr
     r = kit.run("start", GLM53_TF_ABLIT="1", GLM53_TF_ABLIT_DONOR="/ablit/donor.safetensors",
