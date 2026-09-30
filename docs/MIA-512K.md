@@ -138,7 +138,7 @@ aiming at the shape of:
 | Full `q4mse` of the transplanted `o_proj` | Refused by 0420. Patch 0430 quantizes the other non-experts and leaves layers 15–44 `o_proj` in BF16. The imported speed tables are still a different checkpoint. |
 | RoCE (`GLM53_TF_COMM_BACKEND=roce`) | This boot is NCCL on the crossed cable. |
 | Fat MoE, KDA BF16 large-M | Not set. The vLLM kit's fused-MoE and KDA flags have no equivalent turned on here. |
-| KV pool, session GiB, NVMe session tier, prefix share | Not set. `serve.sh` still mounts a sessions directory; the quota knob is off, so it is not a session cache. |
+| Session GiB, NVMe session tier, prefix share | Not set. `serve.sh` still mounts a sessions directory; the quota knob is off, so it is not a session cache. The KV pool is on: `GLM53_TF_KV_POOL_TOKENS=524544` (patches/0290), one latent-FP8 pool shared by the slots. That is the 524,296-slot capacity rounded up to a 256-token page, not the imported 1,048,576-token pool. Admission reserves prompt + max_tokens + 64. |
 | Decode overlap, CPU pin | Off (patch 0370's adopted W10 settings are the other stack). |
 | `GLM53_TF_EFFORT_FIELD` | Unset (default 0). Top-level `reasoning_effort` is ignored. Pass `chat_template_kwargs`. |
 | `FORCE_CONTEXT=1` | Must stay unset. It is the override that lets a per-head cache try a context that does not fit. |
@@ -163,8 +163,19 @@ Rank 0, copied from the container log:
 
 The transplant line on both ranks was `method=transplant layers=15-44 mtp=False mean rel_l2=0.0000
 donor_layer_45=present_not_applied`. Requested batch 2 did not fit: the default reserve keeps 4 GB free and
-one 512k FP8 sequence is 3.96 GB, so the server is **one sequence**. That is the measured concurrency. Do
-not read the README's imported "4 requests" as this process.
+one 512k FP8 sequence is 3.96 GB, so that boot served **one sequence**. Do not read the README's imported
+"4 requests" as this process.
+
+The pool restart (patches/0290, `GLM53_TF_KV_POOL_TOKENS=524544`, same image, prepared folders reused) logged:
+
+```text
+[tensorfold] KV pool (patches/0290): 524544 tokens in pages of 256 shared by every slot; a slot grows to 524296 tokens (2049 pages)
+[tensorfold] latent KV cache (fp8 rows): 7.4 KB a token a rank, in the KV pool: 524544 tokens in pages of 256 (3.72 GB, every slot up to 524296)
+[tensorfold] batching 2 requests: 1 extra sequence(s), 0.21 GB on this rank (524296 cache slots each; ...)
+[tensorfold] KV pool (patches/0290): 524544 tokens in 2049 pages of 256, 3.72 GiB on this rank, shared by the 2 slots
+```
+
+Ready in 48 s. After the engine, MemFree was 14.1 GiB on rank 0. Two short requests at once both finished. A request still cannot spend more pages than the pool. Session quota stays off, so an idle slot spilled to make room is a cold prefill next time, not a resumed cache.
 
 `/v1/models` does not advertise `max_model_len`. The engine log is the context proof (524,288 requested,
 524,296 slots). The sampling line is the checkpoint's generation config before the server merges its default

@@ -91,6 +91,8 @@ cable that actually came up. Same-named HCAs are not on one subnet; listing ever
 | Worker link | `enp1s0f1np1` / `rocep1s0f1` | |
 | Also off | fat MoE, KDA BF16 large-M, KV pool, session quota, prefix share, decode overlap | |
 
+That table is the 2026-09-29 bf16 boot, which allocated one 512k slot and served one sequence. The live profile has since set `GLM53_TF_NONEXPERT=q4mse` and `GLM53_TF_KV_POOL_TOKENS=524544` (patches/0290). The pool restart kept the same image and the same prepared folders. Rank 0 logged one 3.72 GB latent-FP8 pool, 524544 tokens in pages of 256, shared by 2 slots (0.21 GB of extra slot state; each slot can still grow to 524296 tokens). A request reserves prompt + max_tokens + 64 tokens of pages. Session quota, prefix share, and the imported 1,048,576-token pool stay off.
+
 Per-head KV is about 390 KB a token a rank, about 195 GiB at 512k. That does not fit in a 121 GiB GB10 on two
 ranks or three. Latent FP8 is what makes 512k fit (about 3.7 GB a rank). The launcher is two ranks. A third
 Spark is not part of this build.
